@@ -45,6 +45,12 @@ public abstract class ModelLoader {
     }
 
     private static ModelType detectModelType(Map<String, Object> metadata) {
+        // Architecture key is authoritative (set by llama.cpp conversion) and doesn't
+        // depend on how the model happens to be named, unlike general.name below.
+        if ("qwen2moe".equals(metadata.get("general.architecture"))) {
+            return ModelType.QWEN_2_MOE;
+        }
+
         String name = (String) metadata.get("general.name");
 
         // Check by name first

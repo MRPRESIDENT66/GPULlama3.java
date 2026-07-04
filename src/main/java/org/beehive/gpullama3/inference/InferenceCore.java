@@ -1,13 +1,13 @@
 package org.beehive.gpullama3.inference;
 
 import org.beehive.gpullama3.auxiliary.Parallel;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
+import org.beehive.gpullama3.inference.weights.standard.*;
+import org.beehive.gpullama3.model.qwen2.Qwen2MoE;
+import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.standard.FloatTensor;
 import org.beehive.gpullama3.inference.state.Phi3State;
 import org.beehive.gpullama3.inference.state.State;
-import org.beehive.gpullama3.inference.weights.standard.Phi3StandardWeights;
-import org.beehive.gpullama3.inference.weights.standard.Qwen2StandardWeights;
-import org.beehive.gpullama3.inference.weights.standard.Qwen3StandardWeights;
-import org.beehive.gpullama3.inference.weights.standard.StandardWeights;
 import org.beehive.gpullama3.inference.weights.tornado.TornadoWeights;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.Model;
@@ -258,6 +258,204 @@ public final class InferenceCore {
         weights.wcls.matmul(state.x, state.logits, config.vocabularySize(), dim);
 
         return state.logits;
+    }
+    public static FloatTensor forwardJavaQwen2MoE(Model model, State state, int token, int position) {
+        final Qwen2MoEConfiguration config = (Qwen2MoEConfiguration) model.configuration();
+        final Qwen2MoEStandardWeights weights = (Qwen2MoEStandardWeights) model.weights();
+        final Qwen2MoEState moeState = (Qwen2MoEState) state;
+        int dim = config.dim();
+        int headSize = config.headSize();
+        int kvDim = (config.dim() * config.numberOfKeyValueHeads()) / config.numberOfHeads();
+        int kvMul = config.numberOfHeads() / config.numberOfKeyValueHeads(); // integer multiplier of the kv sharing in multiquery
+        float sqrtHeadSize = (float) Math.sqrt(headSize);
+
+        weights.token_embedding_table.copyTo(token * dim, state.x, 0, dim);
+
+        // forward all the layers
+        for (int l = 0; l < config.numberOfLayers(); l++) {
+            // attention rmsnorm
+            final int curLayer = l;
+            rmsnorm(state.xb, state.x, weights.rms_att_weight[curLayer], 0, dim, config.rmsNormEps());
+
+            // qkv matmuls for this position
+            weights.wq[l].matmul(state.xb, state.q, dim, dim);
+            weights.wk[l].matmul(state.xb, state.k, kvDim, dim);
+            weights.wv[l].matmul(state.xb, state.v, kvDim, dim);
+
+            // qkv additions with qkv bias
+            state.q.addInPlace(weights.q_bias[curLayer]);
+            state.k.addInPlace(weights.k_bias[curLayer]);
+            state.v.addInPlace(weights.v_bias[curLayer]);
+
+            // RoPE relative positional encoding: complex-valued rotate q and k in each head
+            // GPT-NeoX style RoPE, real/imaginary components are stored with a headSize/2 offset per head, instead of consecutive.
+            for (int h = 0; h < config.numberOfHeads(); ++h) {
+                int rotn = h < config.numberOfKeyValueHeads() ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+                int poffset = h * headSize;
+                for (int i0 = 0; i0 < headSize; i0 += 2) {
+                    int ic = i0 / 2;
+                    float fcr = weights.freq_cis_real.getFloat((position) * (headSize / 2) + ic);
+                    float fci = weights.freq_cis_imag.getFloat((position) * (headSize / 2) + ic);
+                    for (int vi = 0; vi < rotn; vi++) {
+                        FloatTensor vec = (vi == 0) ? state.q : state.k; // the vector to rotate (query or key)
+                        float v0 = vec.getFloat(poffset + ic);
+                        float v1 = vec.getFloat(poffset + ic + headSize / 2);
+                        vec.setFloat(poffset + ic, v0 * fcr - v1 * fci);
+                        vec.setFloat(poffset + ic + headSize / 2, v0 * fci + v1 * fcr);
+                    }
+                }
+            }
+
+            // save key,value at this time step (position) to our kv cache
+            //int loff = l * config.seq_len * kvDim; // kv cache layer offset for convenience
+            state.k.copyTo(0, state.keyCache[curLayer], position * kvDim, kvDim);
+            state.v.copyTo(0, state.valueCache[curLayer], position * kvDim, kvDim);
+
+            // multihead attention. iterate over all heads
+            Parallel.parallelFor(0, config.numberOfHeads(), h -> {
+                // get the query vector for this head
+                // float* q = s.q + h * headSize;
+                int qOffset = h * headSize;
+
+                // attention scores for this head
+                // float* att = s.att + h * config.seq_len;
+                int attOffset = h * config.contextLength();
+
+                // iterate over all timesteps, including the current one
+                for (int t = 0; t <= position; t++) {
+                    // get the key vector for this head and at this timestep
+                    // float* k = s.key_cache + loff + t * dim + h * headSize;
+                    int keyCacheOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
+                    // calculate the attention score as the dot product of q and k
+                    float score = state.q.dot(qOffset, state.keyCache[curLayer], keyCacheOffset, headSize);
+                    score /= sqrtHeadSize;
+                    // save the score to the attention buffer
+                    state.att.setFloat(attOffset + t, score);
+                }
+
+                // softmax the scores to get attention weights, from 0..position inclusively
+                state.att.softmaxInPlace(attOffset, position + 1);
+
+                // weighted sum of the values, store back into xb
+                // float* xb = s.xb + h * headSize;
+                int xbOffset = h * headSize;
+                // memset(xb, 0, headSize * sizeof(float));
+                state.xb.fillInPlace(xbOffset, headSize, 0f);
+
+                for (int t = 0; t <= position; t++) {
+                    // get the value vector for this head and at this timestep
+                    // float* v = s.value_cache + loff + t * dim + h * headSize;C
+                    int vOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
+                    // get the attention weight for this timestep
+                    float a = state.att.getFloat(attOffset + t);
+                    // accumulate the weighted value into xb
+                    state.xb.saxpyInPlace(xbOffset, state.valueCache[curLayer], vOffset, headSize, a);
+                }
+            });
+
+            // final matmul to get the output of the attention
+            weights.wo[l].matmul(state.xb, state.xb2, dim, dim);
+
+            // residual connection back into x
+            state.x.addInPlace(state.xb2);
+
+            // ========================= FFN block: MoE =========================
+            // NOTE: this scaffold references fields you still need to create:
+            //   Qwen2MoEConfiguration: numberOfExperts(), numberOfExpertsUsed(),
+            //                          moeHiddenDim(), sharedExpertHiddenDim()
+            //   Qwen2MoEStandardWeights: routerGate[], gateExps[], upExps[], downExps[],
+            //                            sharedGate[], sharedUp[], sharedDown[], sharedGateInp[]
+            //   Qwen2MoEState buffers: routerLogits, hbE, hbE2, hbS, hbS2, yTmp
+            // Once those exist, change the two casts at the top of this method to the MoE
+            // types, then replace the TODO lines below with the real calls shown.
+
+            // FFN pre-norm (same as dense): state.xb = rmsnorm(state.x)
+            rmsnorm(state.xb, state.x, weights.rms_ffn_weight[curLayer], 0, dim, config.rmsNormEps());
+
+             int nExp   = config.numberOfExperts();      // 60
+             int topK   = config.numberOfExpertsUsed();  // 4
+             int moeHid = config.moeHiddenDim();          // 1408
+
+            // --- Step A: router scores ---
+            // routerLogits[nExp] = routerGate[l] · xb
+            weights.routerGate[l].matmul(state.xb, moeState.routerLogits, nExp, dim);
+            // --- Step B: pick top-K experts + normalize their weights ---
+             int[] idx = new int[topK]; float[] wgt = new float[topK];
+            for (int i = 0; i < topK; i++) {
+                float best = Float.NEGATIVE_INFINITY;
+                int index = -1;
+                for (int j = 0; j < nExp; j++) {
+                    if (moeState.routerLogits.getFloat(j) > best) {
+                        best = moeState.routerLogits.getFloat(j);
+                        index = j;
+                    }
+                }
+                idx[i] = index;
+                wgt[i] = best;
+                moeState.routerLogits.setFloat(index, Float.NEGATIVE_INFINITY);
+            }
+
+            float maxVal = wgt[0];
+            for (int i = 1; i < topK; i++) {
+                if (wgt[i] > maxVal) maxVal = wgt[i];
+            }
+
+            float sum = 0f;
+            for (int i = 0; i < topK; i++) {
+                wgt[i] = (float) Math.exp(wgt[i] - maxVal);
+                sum += wgt[i];
+            }
+
+            for (int i = 0; i < topK; i++) {
+                wgt[i] /= sum;
+            }
+
+
+//             --- Step C: compute each selected expert and accumulate into x ---
+             for (int j = 0; j < topK; j++) {
+                 int e = idx[j];
+                 int baseGU = e * moeHid * dim;   // gate/up expert offset
+                 int baseD  = e * dim * moeHid;   // down expert offset (rows/cols swapped)
+                 matmulExpert(weights.gateExps[l], baseGU, state.xb, moeState.hbE,  moeHid, dim);
+                 matmulExpert(weights.upExps[l],   baseGU, state.xb, moeState.hbE2, moeHid, dim);
+                 moeState.hbE.mapInPlace(v -> v / (float)(1.0 + Math.exp(-v)));  // silu
+                 moeState.hbE.multiplyInPlace(moeState.hbE2);                        // gate ⊙ up
+                 matmulExpert(weights.downExps[l], baseD, moeState.hbE, moeState.yTmp, dim, moeHid);
+                 state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, wgt[j]);          // x += wgt*y
+             }
+
+            // --- Step D: shared expert (always-on, plain dense FFN) ---
+            // int sHid = config.sharedExpertHiddenDim();   // 5632
+            int sHid = config.sharedExpertHiddenDim();   // 5632
+
+            weights.sharedGate[l].matmul(state.xb, moeState.hbS,  sHid, dim);
+            weights.sharedUp[l].matmul(state.xb,   moeState.hbS2, sHid, dim);
+            moeState.hbS.mapInPlace(v -> v / (float)(1.0 + Math.exp(-v)));   // silu
+            moeState.hbS.multiplyInPlace(moeState.hbS2);
+            weights.sharedDown[l].matmul(moeState.hbS, moeState.yTmp, dim, sHid);
+
+// 算 shared expert 的门控值 g
+            float gateScore = weights.sharedGateInp[l].dot(0, state.xb, 0, dim);
+            float g = 1f / (1f + (float) Math.exp(-gateScore));
+
+            state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, g);
+            // ==================================================================
+        }
+
+        // final rmsnorm + classifier (same as dense Qwen2)
+        rmsnorm(state.x, state.x, weights.rms_final_weight, 0, dim, config.rmsNormEps());
+        weights.wcls.matmul(state.x, state.logits, config.vocabularySize(), dim);
+
+        return state.logits;
+    }
+
+    /**
+     * Like {@link FloatTensor#matmul}, but reads the weight matrix starting at element
+     * offset {@code base} instead of 0 — so it can target ONE expert inside a stacked
+     * {@code [nExpert × d0 × d1]} tensor. out[d0] = (d0×d1 sub-matrix at base) · in[d1].
+     */
+    private static void matmulExpert(FloatTensor w, int base, FloatTensor in, FloatTensor out, int d0, int d1) {
+        Parallel.parallelFor(0, d0, i -> out.setFloat(i, w.dot(base + i * d1, in, 0, d1)));
     }
 
     public static FloatTensor forwardJavaQwen2(Model model, State state, int token, int position) {
