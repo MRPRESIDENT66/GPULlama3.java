@@ -93,6 +93,8 @@ public class Qwen3ChatFormat implements ChatFormat {
         if (imEnd != -1 && !isFim) {
             // Add the end token directly
             tokens.add(imEnd);
+            // Standard ChatML: a newline follows <|im_end|>
+            tokens.addAll(this.tokenizer.encodeOrdinaryAsList("\n"));
         }
         return tokens;
     }
