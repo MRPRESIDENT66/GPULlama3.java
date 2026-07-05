@@ -65,13 +65,61 @@ public final class Q8_0FloatTensor extends FloatTensor {
 
     public static final ValueLayout.OfShort JAVA_SHORT_LE = ValueLayout.JAVA_SHORT.withOrder(ByteOrder.LITTLE_ENDIAN);
 
+    // When enabled, quantize the activation to Q8_0 and do an int8·int8 dot,
+    // matching llama.cpp's Q8_0 matmul numerics exactly.
+    static final boolean QUANTIZE_ACTIVATION = Boolean.parseBoolean(System.getProperty("llama.quantizeActivation", "true"));
+
     @Override
     public float dot(int thisOffset, FloatTensor that, int thatOffset, int size) {
+        if (QUANTIZE_ACTIVATION) {
+            return dotQ8Activation(thisOffset, that, thatOffset, size);
+        }
         if (USE_VECTOR_API) {
             return vectorDot(this, thisOffset, (ArrayFloatTensor) that, thatOffset, size);
         } else {
             return FloatTensor.scalarDot(this, thisOffset, that, thatOffset, size);
         }
+    }
+
+    /**
+     * Q8_0 weight · activation, where the activation is first quantized to Q8_0 (per 32-element
+     * block) and the dot is accumulated as int8·int8 -> int32, then scaled. This mirrors
+     * llama.cpp's ggml Q8_0 matmul path. Assumes thisOffset and size are multiples of the
+     * Q8_0 block size (32), which holds for all matmul callers.
+     */
+    private float dotQ8Activation(int thisOffset, FloatTensor that, int thatOffset, int size) {
+        final int BS = GGMLType.Q8_0.getBlockSize();  // 32
+        final int TS = GGMLType.Q8_0.getTypeSize();   // 34
+        float result = 0f;
+        int nBlocks = size / BS;
+        for (int b = 0; b < nBlocks; b++) {
+            int elemBase = b * BS;
+            int wBlockOffset = (thisOffset + elemBase) / BS * TS;
+            float wScale = Float.float16ToFloat(readShort(memorySegment, wBlockOffset));
+
+            // find the max abs of this activation block -> activation scale
+            float amax = 0f;
+            for (int i = 0; i < BS; i++) {
+                float av = Math.abs(that.getFloat(thatOffset + elemBase + i));
+                if (av > amax) amax = av;
+            }
+            // Match ggml's Q8_0 quantization order: derive the int8 values using the
+            // full-precision scale, but store/use the scale itself as f16.
+            float quantizationScale = amax / 127f;
+            float aScale = Float.float16ToFloat(Float.floatToFloat16(quantizationScale));
+            float aInv = quantizationScale != 0f ? 1f / quantizationScale : 0f;
+
+            // int8 · int8 accumulation (round-half-away-from-zero, matching ggml roundf)
+            int isum = 0;
+            for (int i = 0; i < BS; i++) {
+                float s = that.getFloat(thatOffset + elemBase + i) * aInv;
+                int aq = (int) (s + Math.copySign(0.5f, s));
+                byte wq = readByte(memorySegment, wBlockOffset + Float16.BYTES + i);
+                isum += aq * wq;
+            }
+            result += isum * (wScale * aScale);
+        }
+        return result;
     }
 
     private static float vectorDot(Q8_0FloatTensor thiz, int thisOffset, ArrayFloatTensor that, int thatOffset, int size) {
