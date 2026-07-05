@@ -379,8 +379,11 @@ public final class InferenceCore {
             // --- Step A: router scores ---
             // routerLogits[nExp] = routerGate[l] · xb
             weights.routerGate[l].matmul(state.xb, moeState.routerLogits, nExp, dim);
-            // --- Step B: pick top-K experts + normalize their weights ---
-             int[] idx = new int[topK]; float[] wgt = new float[topK];
+            // --- Step B: softmax over ALL experts, then pick top-K (no renormalization) ---
+            // Qwen1.5-MoE uses norm_topk_prob=false: each selected expert's routing weight is
+            // its softmax probability over all experts, WITHOUT rescaling the top-K to sum=1.
+            moeState.routerLogits.softmaxInPlace(0, nExp);
+            int[] idx = new int[topK]; float[] wgt = new float[topK];
             for (int i = 0; i < topK; i++) {
                 float best = Float.NEGATIVE_INFINITY;
                 int index = -1;
@@ -391,23 +394,8 @@ public final class InferenceCore {
                     }
                 }
                 idx[i] = index;
-                wgt[i] = best;
+                wgt[i] = best;   // softmax probability over all experts, used directly
                 moeState.routerLogits.setFloat(index, Float.NEGATIVE_INFINITY);
-            }
-
-            float maxVal = wgt[0];
-            for (int i = 1; i < topK; i++) {
-                if (wgt[i] > maxVal) maxVal = wgt[i];
-            }
-
-            float sum = 0f;
-            for (int i = 0; i < topK; i++) {
-                wgt[i] = (float) Math.exp(wgt[i] - maxVal);
-                sum += wgt[i];
-            }
-
-            for (int i = 0; i < topK; i++) {
-                wgt[i] /= sum;
             }
 
 
