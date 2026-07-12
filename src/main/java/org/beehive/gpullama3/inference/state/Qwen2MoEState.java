@@ -31,12 +31,12 @@ public class Qwen2MoEState extends Qwen2State {
     public final FloatTensor yTmp;
 
     public Qwen2MoEState(Configuration config, int batchsize) {
-        super(config, batchsize);  // allocate all the regular Qwen2State buffers first
+        super(config, batchsize);
         Qwen2MoEConfiguration c = (Qwen2MoEConfiguration) config;
         this.routerLogits = ArrayFloatTensor.allocate(c.numberOfExperts());
-        this.hbE  = ArrayFloatTensor.allocate(c.moeHiddenDim());
+        this.hbE = ArrayFloatTensor.allocate(c.moeHiddenDim());
         this.hbE2 = ArrayFloatTensor.allocate(c.moeHiddenDim());
-        this.hbS  = ArrayFloatTensor.allocate(c.sharedExpertHiddenDim());
+        this.hbS = ArrayFloatTensor.allocate(c.sharedExpertHiddenDim());
         this.hbS2 = ArrayFloatTensor.allocate(c.sharedExpertHiddenDim());
         this.yTmp = ArrayFloatTensor.allocate(c.dim());
     }
@@ -60,8 +60,12 @@ public class Qwen2MoEState extends Qwen2State {
         fields.att = ArrayFloatTensor.allocate(config.numberOfHeads(), config.contextLength());
         fields.logits = ArrayFloatTensor.allocate(config.vocabularySize());
 
-        fields.keyCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa)).limit(config.numberOfLayers()).toArray(FloatTensor[]::new);
-        fields.valueCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa)).limit(config.numberOfLayers()).toArray(FloatTensor[]::new);
+        fields.keyCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa))
+                .limit(config.numberOfLayers())
+                .toArray(FloatTensor[]::new);
+        fields.valueCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa))
+                .limit(config.numberOfLayers())
+                .toArray(FloatTensor[]::new);
 
         switch (config.quantization()) {
             case "FP16" -> fields.createActivationFP16(config.dim());

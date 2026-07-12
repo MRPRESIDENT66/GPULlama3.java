@@ -1,5 +1,6 @@
 package org.beehive.gpullama3.model.loader;
 
+import org.beehive.gpullama3.auxiliary.Pair;
 import org.beehive.gpullama3.inference.operation.RoPE;
 import org.beehive.gpullama3.inference.weights.Weights;
 import org.beehive.gpullama3.inference.weights.standard.Qwen2MoEStandardWeights;
@@ -8,18 +9,21 @@ import org.beehive.gpullama3.model.qwen2.Qwen2MoE;
 import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.GGMLTensorEntry;
 import org.beehive.gpullama3.tensor.GGUF;
-import org.beehive.gpullama3.auxiliary.Pair;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
 import org.beehive.gpullama3.tokenizer.Qwen3Tokenizer;
 import org.beehive.gpullama3.tokenizer.Tokenizer;
 import org.beehive.gpullama3.tokenizer.Vocabulary;
 
-import static org.beehive.gpullama3.model.loader.ModelLoader.*;
-
 import java.nio.channels.FileChannel;
 import java.util.Map;
 
-public class Qwen2MoEModelLoader  extends AbstractModelLoader<Qwen2MoE, Qwen2MoEConfiguration> {
+import static org.beehive.gpullama3.model.loader.ModelLoader.*;
+
+public class Qwen2MoEModelLoader extends AbstractModelLoader<Qwen2MoE, Qwen2MoEConfiguration> {
+    public Qwen2MoEModelLoader(FileChannel fileChannel, GGUF gguf, int contextLength, boolean useTornadovm) {
+        super(fileChannel, gguf, contextLength, useTornadovm);
+    }
+
     @Override
     protected Vocabulary loadVocabulary(Map<String, Object> metadata) {
         return Vocabulary.loadQwen3Vocabulary(metadata);
@@ -42,10 +46,6 @@ public class Qwen2MoEModelLoader  extends AbstractModelLoader<Qwen2MoE, Qwen2MoE
         return new Qwen2MoE(config, tokenizer, weights, ChatFormat.create(tokenizer, chatTokens));
     }
 
-    public Qwen2MoEModelLoader(FileChannel fileChannel, GGUF gguf, int contextLength, boolean useTornadovm) {
-        super(fileChannel, gguf, contextLength, useTornadovm);
-    }
-
     @Override
     protected Qwen2MoEConfiguration createConfiguration(Map<String, Object> metadata) {
         int modelContextLength = (int) metadata.get("qwen2moe.context_length");
@@ -57,24 +57,24 @@ public class Qwen2MoEModelLoader  extends AbstractModelLoader<Qwen2MoE, Qwen2MoE
 
         return new Qwen2MoEConfiguration(
                 getModelQuantization(metadata),                          // quantization
-                (int) metadata.get("qwen2moe.embedding_length"),          // dim
+                (int) metadata.get("qwen2moe.embedding_length"),         // dim
                 0,                                                       // hiddenDim
-        (int) metadata.get("qwen2moe.block_count"),               // numberOfLayers
+                (int) metadata.get("qwen2moe.block_count"),              // numberOfLayers
                 (int) metadata.get("qwen2moe.attention.head_count"),      // numberOfHeads
-                numberOfKeyValueHeads,                                     // numberOfKeyValueHeads
-                numberOfKeyValueHeads,                                     // numberOfHeadsKey
-                numberOfKeyValueHeads,                                     // numberOfHeadsValue
-                vocabSize,                                                 // vocabularySize
-                modelContextLength,                                        // contextLengthModel
-                finalContextLength,                                        // contextLength
+                numberOfKeyValueHeads,                                    // numberOfKeyValueHeads
+                numberOfKeyValueHeads,                                    // numberOfHeadsKey
+                numberOfKeyValueHeads,                                    // numberOfHeadsValue
+                vocabSize,                                                // vocabularySize
+                modelContextLength,                                       // contextLengthModel
+                finalContextLength,                                       // contextLength
                 (int) metadata.get("qwen2moe.expert_count"),               // numberOfExperts
                 (int) metadata.get("qwen2moe.expert_used_count"),          // numberOfExpertsUsed
-                moeHiddenDim,                                               // moeHiddenDim
+                moeHiddenDim,                                             // moeHiddenDim
                 (int) metadata.get("qwen2moe.feed_forward_length"),        // sharedExpertHiddenDim
-                false,                                                      // sharedWeights
+                false,                                                    // sharedWeights
                 (float) metadata.get("qwen2moe.attention.layer_norm_rms_epsilon"), // rmsNormEps
                 (float) metadata.get("qwen2moe.rope.freq_base")            // ropeTheta
-);
+        );
     }
 
     @Override

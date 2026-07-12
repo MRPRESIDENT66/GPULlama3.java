@@ -4,17 +4,17 @@ import org.beehive.gpullama3.tensor.GGMLType;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
 import org.beehive.gpullama3.tensor.standard.FloatTensor;
 
-public class Qwen2MoEStandardWeights extends StandardWeights{
-    // Qwen2-specific weights
+public class Qwen2MoEStandardWeights extends StandardWeights {
+    // Qwen2-MoE-specific weights
     public final FloatTensor[] q_bias, k_bias, v_bias;
     public final FloatTensor[] routerGate;
     public final FloatTensor[] gateExps;
-    public final FloatTensor[] upExps;       // [层数]
-    public final FloatTensor[] downExps;     // [层数]
-    public final FloatTensor[] sharedGate;   // [层数]，shared expert
-    public final FloatTensor[] sharedUp;     // [层数]
-    public final FloatTensor[] sharedDown;   // [层数]
-    public final FloatTensor[] sharedGateInp; // [层数]，shared expert 的 sigmoid gate 输入
+    public final FloatTensor[] upExps;
+    public final FloatTensor[] downExps;
+    public final FloatTensor[] sharedGate;
+    public final FloatTensor[] sharedUp;
+    public final FloatTensor[] sharedDown;
+    public final FloatTensor[] sharedGateInp;
 
     public Qwen2MoEStandardWeights(
             FloatTensor token_embedding_table,
@@ -43,7 +43,6 @@ public class Qwen2MoEStandardWeights extends StandardWeights{
             ArrayFloatTensor freq_cis_imag,
             FloatTensor wcls,
             GGMLType weightType) {
-        // call to StandardWeights constructor
         super(token_embedding_table,
                 rms_att_weight,
                 wq,
@@ -59,7 +58,6 @@ public class Qwen2MoEStandardWeights extends StandardWeights{
                 freq_cis_imag,
                 wcls,
                 weightType);
-        // init Qwen2-specific fields
         this.q_bias = q_bias;
         this.k_bias = k_bias;
         this.v_bias = v_bias;

@@ -259,6 +259,7 @@ public final class InferenceCore {
 
         return state.logits;
     }
+
     public static FloatTensor forwardJavaQwen2MoE(Model model, State state, int token, int position) {
         final Qwen2MoEConfiguration config = (Qwen2MoEConfiguration) model.configuration();
         final Qwen2MoEStandardWeights weights = (Qwen2MoEStandardWeights) model.weights();
@@ -359,75 +360,60 @@ public final class InferenceCore {
             // residual connection back into x
             state.x.addInPlace(state.xb2);
 
-            // ========================= FFN block: MoE =========================
-            // NOTE: this scaffold references fields you still need to create:
-            //   Qwen2MoEConfiguration: numberOfExperts(), numberOfExpertsUsed(),
-            //                          moeHiddenDim(), sharedExpertHiddenDim()
-            //   Qwen2MoEStandardWeights: routerGate[], gateExps[], upExps[], downExps[],
-            //                            sharedGate[], sharedUp[], sharedDown[], sharedGateInp[]
-            //   Qwen2MoEState buffers: routerLogits, hbE, hbE2, hbS, hbS2, yTmp
-            // Once those exist, change the two casts at the top of this method to the MoE
-            // types, then replace the TODO lines below with the real calls shown.
-
-            // FFN pre-norm (same as dense): state.xb = rmsnorm(state.x)
+            // MoE FFN pre-normalization
             rmsnorm(state.xb, state.x, weights.rms_ffn_weight[curLayer], 0, dim, config.rmsNormEps());
 
-             int nExp   = config.numberOfExperts();      // 60
-             int topK   = config.numberOfExpertsUsed();  // 4
-             int moeHid = config.moeHiddenDim();          // 1408
+            int numberOfExperts = config.numberOfExperts();
+            int topK = config.numberOfExpertsUsed();
+            int expertHiddenDim = config.moeHiddenDim();
 
-            // --- Step A: router scores ---
-            // routerLogits[nExp] = routerGate[l] · xb
-            weights.routerGate[l].matmul(state.xb, moeState.routerLogits, nExp, dim);
-            // --- Step B: softmax over ALL experts, then pick top-K (no renormalization) ---
+            // Compute routing probabilities over all experts, then select top-k.
             // Qwen1.5-MoE uses norm_topk_prob=false: each selected expert's routing weight is
-            // its softmax probability over all experts, WITHOUT rescaling the top-K to sum=1.
-            moeState.routerLogits.softmaxInPlace(0, nExp);
-            int[] idx = new int[topK]; float[] wgt = new float[topK];
+            // its probability over all experts without rescaling the top-k weights to sum to one.
+            weights.routerGate[l].matmul(state.xb, moeState.routerLogits, numberOfExperts, dim);
+            moeState.routerLogits.softmaxInPlace(0, numberOfExperts);
+
+            int[] selectedExperts = new int[topK];
+            float[] routingWeights = new float[topK];
             for (int i = 0; i < topK; i++) {
                 float best = Float.NEGATIVE_INFINITY;
                 int index = -1;
-                for (int j = 0; j < nExp; j++) {
+                for (int j = 0; j < numberOfExperts; j++) {
                     if (moeState.routerLogits.getFloat(j) > best) {
                         best = moeState.routerLogits.getFloat(j);
                         index = j;
                     }
                 }
-                idx[i] = index;
-                wgt[i] = best;   // softmax probability over all experts, used directly
+                selectedExperts[i] = index;
+                routingWeights[i] = best;
                 moeState.routerLogits.setFloat(index, Float.NEGATIVE_INFINITY);
             }
 
+            // Compute each selected expert and accumulate its weighted output.
+            for (int j = 0; j < topK; j++) {
+                int expert = selectedExperts[j];
+                int gateUpOffset = expert * expertHiddenDim * dim;
+                int downOffset = expert * dim * expertHiddenDim;
+                matmulExpert(weights.gateExps[l], gateUpOffset, state.xb, moeState.hbE, expertHiddenDim, dim);
+                matmulExpert(weights.upExps[l], gateUpOffset, state.xb, moeState.hbE2, expertHiddenDim, dim);
+                moeState.hbE.mapInPlace(v -> v / (float) (1.0 + Math.exp(-v)));
+                moeState.hbE.multiplyInPlace(moeState.hbE2);
+                matmulExpert(weights.downExps[l], downOffset, moeState.hbE, moeState.yTmp, dim, expertHiddenDim);
+                state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, routingWeights[j]);
+            }
 
-//             --- Step C: compute each selected expert and accumulate into x ---
-             for (int j = 0; j < topK; j++) {
-                 int e = idx[j];
-                 int baseGU = e * moeHid * dim;   // gate/up expert offset
-                 int baseD  = e * dim * moeHid;   // down expert offset (rows/cols swapped)
-                 matmulExpert(weights.gateExps[l], baseGU, state.xb, moeState.hbE,  moeHid, dim);
-                 matmulExpert(weights.upExps[l],   baseGU, state.xb, moeState.hbE2, moeHid, dim);
-                 moeState.hbE.mapInPlace(v -> v / (float)(1.0 + Math.exp(-v)));  // silu
-                 moeState.hbE.multiplyInPlace(moeState.hbE2);                        // gate ⊙ up
-                 matmulExpert(weights.downExps[l], baseD, moeState.hbE, moeState.yTmp, dim, moeHid);
-                 state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, wgt[j]);          // x += wgt*y
-             }
-
-            // --- Step D: shared expert (always-on, plain dense FFN) ---
-            // int sHid = config.sharedExpertHiddenDim();   // 5632
-            int sHid = config.sharedExpertHiddenDim();   // 5632
-
-            weights.sharedGate[l].matmul(state.xb, moeState.hbS,  sHid, dim);
-            weights.sharedUp[l].matmul(state.xb,   moeState.hbS2, sHid, dim);
-            moeState.hbS.mapInPlace(v -> v / (float)(1.0 + Math.exp(-v)));   // silu
+            // Compute the always-on shared expert.
+            int sharedExpertHiddenDim = config.sharedExpertHiddenDim();
+            weights.sharedGate[l].matmul(state.xb, moeState.hbS, sharedExpertHiddenDim, dim);
+            weights.sharedUp[l].matmul(state.xb, moeState.hbS2, sharedExpertHiddenDim, dim);
+            moeState.hbS.mapInPlace(v -> v / (float) (1.0 + Math.exp(-v)));
             moeState.hbS.multiplyInPlace(moeState.hbS2);
-            weights.sharedDown[l].matmul(moeState.hbS, moeState.yTmp, dim, sHid);
+            weights.sharedDown[l].matmul(moeState.hbS, moeState.yTmp, dim, sharedExpertHiddenDim);
 
-// 算 shared expert 的门控值 g
+            // Gate the shared expert output.
             float gateScore = weights.sharedGateInp[l].dot(0, state.xb, 0, dim);
-            float g = 1f / (1f + (float) Math.exp(-gateScore));
-
-            state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, g);
-            // ==================================================================
+            float sharedExpertWeight = 1f / (1f + (float) Math.exp(-gateScore));
+            state.x.saxpyInPlace(0, moeState.yTmp, 0, dim, sharedExpertWeight);
         }
 
         // final rmsnorm + classifier (same as dense Qwen2)

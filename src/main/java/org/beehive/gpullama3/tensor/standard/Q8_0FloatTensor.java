@@ -66,7 +66,7 @@ public final class Q8_0FloatTensor extends FloatTensor {
     public static final ValueLayout.OfShort JAVA_SHORT_LE = ValueLayout.JAVA_SHORT.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     // When enabled, quantize the activation to Q8_0 and do an int8·int8 dot,
-    // matching llama.cpp's Q8_0 matmul numerics exactly.
+    // matching llama.cpp's Q8_0 matmul quantization scheme.
     static final boolean QUANTIZE_ACTIVATION = Boolean.parseBoolean(System.getProperty("llama.quantizeActivation", "true"));
 
     @Override
