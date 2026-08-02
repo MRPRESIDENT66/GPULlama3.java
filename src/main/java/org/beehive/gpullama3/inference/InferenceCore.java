@@ -18,6 +18,7 @@ import org.beehive.gpullama3.model.qwen2.Qwen2Configuration;
 import org.beehive.gpullama3.model.qwen3.Qwen3Configuration;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 
 import java.lang.foreign.MemorySegment;
 
@@ -371,6 +372,13 @@ public final class InferenceCore {
             // Qwen1.5-MoE uses norm_topk_prob=false: each selected expert's routing weight is
             // its probability over all experts without rescaling the top-k weights to sum to one.
             weights.routerGate[l].matmul(state.xb, moeState.routerLogits, numberOfExperts, dim);
+            float[] rawRouterLogits = null;
+            if (MoECorrectnessTrace.isEnabled()) {
+                rawRouterLogits = new float[numberOfExperts];
+                for (int expert = 0; expert < numberOfExperts; expert++) {
+                    rawRouterLogits[expert] = moeState.routerLogits.getFloat(expert);
+                }
+            }
             moeState.routerLogits.softmaxInPlace(0, numberOfExperts);
 
             int[] selectedExperts = new int[topK];
@@ -387,6 +395,10 @@ public final class InferenceCore {
                 selectedExperts[i] = index;
                 routingWeights[i] = best;
                 moeState.routerLogits.setFloat(index, Float.NEGATIVE_INFINITY);
+            }
+            if (MoECorrectnessTrace.isEnabled()) {
+                MoECorrectnessTrace.recordCpuRouter(position, l, rawRouterLogits,
+                        selectedExperts, routingWeights);
             }
 
             // Compute each selected expert and accumulate its weighted output.
@@ -419,6 +431,7 @@ public final class InferenceCore {
         // final rmsnorm + classifier (same as dense Qwen2)
         rmsnorm(state.x, state.x, weights.rms_final_weight, 0, dim, config.rmsNormEps());
         weights.wcls.matmul(state.x, state.logits, config.vocabularySize(), dim);
+        MoECorrectnessTrace.recordCpuLogits(position, state.logits);
 
         return state.logits;
     }

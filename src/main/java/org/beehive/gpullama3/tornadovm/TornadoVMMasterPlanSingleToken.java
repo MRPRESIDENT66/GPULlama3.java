@@ -11,6 +11,8 @@ import org.beehive.gpullama3.tornadovm.plan.layout.SingleTokenForwardTaskGraphLa
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
+import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 
 /**
  * Standard (single-token) GPU execution plan.
@@ -81,6 +83,11 @@ public class TornadoVMMasterPlanSingleToken implements TornadoVMMasterPlan {
             executionPlan.withGraph(taskGraphLayout.layerIdx(layer))
                          .withGridScheduler(tornadoVMForwardPlan.getGridScheduler())
                          .execute();
+            if (MoECorrectnessTrace.isEnabled() && state instanceof Qwen2MoEState moeState) {
+                MoECorrectnessTrace.recordGpuRouter(position, layer,
+                        moeState.wrapRawRouterLogits, moeState.wrapSelectedExperts,
+                        moeState.wrapRoutingWeights);
+            }
         }
         state.tempLogits.clear();
         state.wrapLogits.clear();
@@ -90,6 +97,7 @@ public class TornadoVMMasterPlanSingleToken implements TornadoVMMasterPlan {
             logitsGraph.withCUDAGraph();
         }
         logitsGraph.execute();
+        MoECorrectnessTrace.recordGpuLogits(position, state.wrapLogits);
 
         return state.wrapLogits;
     }

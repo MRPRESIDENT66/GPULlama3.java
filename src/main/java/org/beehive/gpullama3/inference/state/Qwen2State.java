@@ -12,9 +12,11 @@ import java.util.stream.Stream;
 
 public class Qwen2State extends State {
 
+    protected static final int QWEN2_LOCAL_SIZE = 32;
+
     public Qwen2State(Configuration config, int batchsize) {
         super(config, batchsize);
-        this.localSize = 32;
+        this.localSize = QWEN2_LOCAL_SIZE;
     }
     @Override
     protected StateFields createStateFields(Configuration configuration) {
@@ -66,9 +68,11 @@ public class Qwen2State extends State {
         fields.positionHolder = new IntArray(1);
 
         // Temporary arrays
-        fields.temp = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
-        fields.tempFFN = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
-        fields.tempLogits = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
+        // State invokes this override before the Qwen2State constructor body runs,
+        // so use the Qwen2 work-group size directly instead of State.localSize.
+        fields.temp = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
+        fields.tempFFN = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
+        fields.tempLogits = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
 
         return fields;
 

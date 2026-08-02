@@ -30,6 +30,17 @@ public class Qwen2MoEState extends Qwen2State {
     // before it is weighted and accumulated into the residual stream (state.x).
     public final FloatTensor yTmp;
 
+    // TornadoVM buffers for the single-token GPU MoE path.  These are deliberately
+    // separate from the CPU FloatTensor fields above: TaskGraph kernels operate on
+    // TornadoVM arrays that can remain resident on the device between tasks.
+    public final FloatArray wrapRouterLogits;
+    public final FloatArray wrapRawRouterLogits;
+    public final IntArray wrapSelectedExperts;
+    public final FloatArray wrapRoutingWeights;
+    public final FloatArray wrapExpertGate;
+    public final FloatArray wrapSharedGate;
+    public final FloatArray wrapSharedOutput;
+
     public Qwen2MoEState(Configuration config, int batchsize) {
         super(config, batchsize);
         Qwen2MoEConfiguration c = (Qwen2MoEConfiguration) config;
@@ -39,6 +50,14 @@ public class Qwen2MoEState extends Qwen2State {
         this.hbS = ArrayFloatTensor.allocate(c.sharedExpertHiddenDim());
         this.hbS2 = ArrayFloatTensor.allocate(c.sharedExpertHiddenDim());
         this.yTmp = ArrayFloatTensor.allocate(c.dim());
+
+        this.wrapRouterLogits = new FloatArray(c.numberOfExperts());
+        this.wrapRawRouterLogits = new FloatArray(c.numberOfExperts());
+        this.wrapSelectedExperts = new IntArray(c.numberOfExpertsUsed());
+        this.wrapRoutingWeights = new FloatArray(c.numberOfExpertsUsed());
+        this.wrapExpertGate = new FloatArray(c.moeHiddenDim());
+        this.wrapSharedGate = new FloatArray(c.sharedExpertHiddenDim());
+        this.wrapSharedOutput = new FloatArray(c.dim());
     }
 
     @Override
@@ -91,9 +110,11 @@ public class Qwen2MoEState extends Qwen2State {
         fields.wrapAtt = new FloatArray(config.numberOfHeads() * config.contextLength());
         fields.positionHolder = new IntArray(1);
 
-        fields.temp = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
-        fields.tempFFN = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
-        fields.tempLogits = new FloatArray(1 + ((config.dim() + localSize - 1) / localSize));
+        // State invokes this override before the Qwen2State constructor body runs,
+        // so use the Qwen2 work-group size directly instead of State.localSize.
+        fields.temp = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
+        fields.tempFFN = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
+        fields.tempLogits = new FloatArray(1 + ((config.dim() + QWEN2_LOCAL_SIZE - 1) / QWEN2_LOCAL_SIZE));
 
         return fields;
     }

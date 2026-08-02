@@ -4,18 +4,23 @@ import org.beehive.gpullama3.auxiliary.Pair;
 import org.beehive.gpullama3.inference.operation.RoPE;
 import org.beehive.gpullama3.inference.weights.Weights;
 import org.beehive.gpullama3.inference.weights.standard.Qwen2MoEStandardWeights;
+import org.beehive.gpullama3.inference.weights.tornado.Qwen2MoETornadoWeights;
 import org.beehive.gpullama3.model.format.ChatFormat;
 import org.beehive.gpullama3.model.qwen2.Qwen2MoE;
 import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.GGMLTensorEntry;
+import org.beehive.gpullama3.tensor.GGMLType;
 import org.beehive.gpullama3.tensor.GGUF;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
+import org.beehive.gpullama3.tensor.tornado.FP32TornadoTensor;
 import org.beehive.gpullama3.tokenizer.Qwen3Tokenizer;
 import org.beehive.gpullama3.tokenizer.Tokenizer;
 import org.beehive.gpullama3.tokenizer.Vocabulary;
 
 import java.nio.channels.FileChannel;
 import java.util.Map;
+
+import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 
 import static org.beehive.gpullama3.model.loader.ModelLoader.*;
 
@@ -118,6 +123,36 @@ public class Qwen2MoEModelLoader extends AbstractModelLoader<Qwen2MoE, Qwen2MoEC
     protected Weights createTornadoVMWeights(Map<String, GGMLTensorEntry> tensorEntries, Qwen2MoEConfiguration config,
                                               Pair<float[], float[]> ropeFreqs, GGMLTensorEntry tokenEmbeddings,
                                               GGMLTensorEntry outputWeight) {
-        throw new UnsupportedOperationException("GPU MoE weights not yet supported");
+        GGMLType ggmlType = effectiveGpuWeightType(outputWeight.ggmlType());
+        if (ggmlType != GGMLType.F16 && ggmlType != GGMLType.Q8_0) {
+            throw new UnsupportedOperationException(
+                    "Type: " + ggmlType + " currently not supported for TornadoVM weights.");
+        }
+
+        final int nl = config.numberOfLayers();
+        return new Qwen2MoETornadoWeights(
+                loadTornadoTensor(tokenEmbeddings),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_norm.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_q.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_k.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_v.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_q.bias")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_k.bias")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_v.bias")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_inp.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_exps.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_up_exps.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_down_exps.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_shexp.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_up_shexp.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_down_shexp.weight")),
+                loadArrayOfTornadoTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_inp_shexp.weight")),
+                loadTornadoTensor(tensorEntries.get("output_norm.weight")),
+                new FP32TornadoTensor(FloatArray.fromArray(ropeFreqs.first())),
+                new FP32TornadoTensor(FloatArray.fromArray(ropeFreqs.second())),
+                loadTornadoTensor(outputWeight),
+                ggmlType);
     }
 }

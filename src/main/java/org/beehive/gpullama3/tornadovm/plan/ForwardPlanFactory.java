@@ -4,6 +4,7 @@ import org.beehive.gpullama3.inference.state.DevstralState;
 import org.beehive.gpullama3.inference.state.GraniteState;
 import org.beehive.gpullama3.inference.state.LlamaState;
 import org.beehive.gpullama3.inference.state.Phi3State;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.state.Qwen2State;
 import org.beehive.gpullama3.inference.state.Qwen3State;
 import org.beehive.gpullama3.inference.state.State;
@@ -24,6 +25,7 @@ import org.beehive.gpullama3.tornadovm.plan.components.q8_0.LlamaQ8_0PlanCompone
 import org.beehive.gpullama3.tornadovm.plan.components.q8_0.MistralQ8_0PlanComponents;
 import org.beehive.gpullama3.tornadovm.plan.components.q8_0.Phi3Q8_0PlanComponents;
 import org.beehive.gpullama3.tornadovm.plan.components.q8_0.Qwen2Q8_0PlanComponents;
+import org.beehive.gpullama3.tornadovm.plan.components.q8_0.Qwen2MoEQ8_0PlanComponents;
 import org.beehive.gpullama3.tornadovm.plan.components.q8_0.Qwen3Q8_0PlanComponents;
 
 // @formatter:off
@@ -109,6 +111,7 @@ public class ForwardPlanFactory {
             case MISTRAL -> createMistralQ8_0Plan(mode, (LlamaState) state, model);
             case DEVSTRAL_2 -> createDevstralQ8_0Plan(mode, (DevstralState) state, model);
             case QWEN_2 -> createQwen2Q8_0Plan(mode, (Qwen2State) state, model);
+            case QWEN_2_MOE -> createQwen2MoEQ8_0Plan(mode, (Qwen2MoEState) state, model);
             case QWEN_3 -> createQwen3Q8_0Plan(mode, (Qwen3State) state, model);
             case PHI_3 -> createPhi3Q8_0Plan(mode, (Phi3State) state, model);
             case GRANITE -> createGraniteQ8_0Plan(mode, (GraniteState) state, model);
@@ -173,6 +176,12 @@ public class ForwardPlanFactory {
         if (mode != ExecutionMode.STANDARD)
             throw new UnsupportedOperationException(mode + " not yet supported for QWEN_2 + Q8_0");
         return new SingleTokenForwardPlan(model, new Qwen2Q8_0PlanComponents(state, model));
+    }
+
+    private static ForwardPlan createQwen2MoEQ8_0Plan(ExecutionMode mode, Qwen2MoEState state, Model model) {
+        if (mode != ExecutionMode.STANDARD)
+            throw new UnsupportedOperationException(mode + " not yet supported for QWEN_2_MOE + Q8_0");
+        return new SingleTokenForwardPlan(model, new Qwen2MoEQ8_0PlanComponents(state, model));
     }
 
     private static ForwardPlan createQwen3FP16Plan(ExecutionMode mode, Qwen3State state, Model model) {

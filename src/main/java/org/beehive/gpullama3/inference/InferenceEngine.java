@@ -8,6 +8,7 @@ import org.beehive.gpullama3.model.Model;
 import org.beehive.gpullama3.tokenizer.Tokenizer;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
@@ -195,6 +196,7 @@ public final class InferenceEngine {
 
             // Track the generated token
             generatedTokens.add(nextToken);
+            MoECorrectnessTrace.recordToken(nextToken);
 
             // Notify via callback if provided
             if (onTokenGenerated != null) {
@@ -286,7 +288,7 @@ public final class InferenceEngine {
         int actualMaxTokens = Math.min(maxTokens > 0 ? maxTokens : model.configuration().contextLength(), model.configuration().contextLength());
 
         // Preallocate with expected capacity to avoid resizing
-        List<Integer> generatedTokens = new ArrayList<>(Math.min(256, actualMaxTokens - promptTokens.size())); // Conservative estimate
+        List<Integer> generatedTokens = new ArrayList<>(Math.max(0, Math.min(256, actualMaxTokens - promptTokens.size()))); // Conservative estimate
 
         // === Token Generation Loop ===
         int currentToken = state.latestToken;
@@ -374,7 +376,7 @@ public final class InferenceEngine {
         int actualMaxTokens = Math.min(maxTokens > 0 ? maxTokens : model.configuration().contextLength(), model.configuration().contextLength());
 
         // Preallocate with expected capacity to avoid resizing
-        List<Integer> generatedTokens = new ArrayList<>(Math.min(256, actualMaxTokens - promptTokens.size())); // Conservative estimate
+        List<Integer> generatedTokens = new ArrayList<>(Math.max(0, Math.min(256, actualMaxTokens - promptTokens.size()))); // Conservative estimate
 
         // Initialize token variables
         int currentToken = state.latestToken; // BOS?
@@ -431,6 +433,7 @@ public final class InferenceEngine {
 
             // Track the generated token
             generatedTokens.add(nextToken);
+            MoECorrectnessTrace.recordToken(nextToken);
 
             // Notify via callback if provided
             if (onTokenGenerated != null) {

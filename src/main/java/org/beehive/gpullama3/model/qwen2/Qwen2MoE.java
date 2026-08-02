@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.IntConsumer;
 
+import static org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan.WITH_PREFILL_DECODE;
+
 public class Qwen2MoE extends AbstractModel {
 
     Qwen2MoEConfiguration configuration;
@@ -71,7 +73,11 @@ public class Qwen2MoE extends AbstractModel {
 
     @Override
     public void forward(State state, int token, int position) {
-        InferenceCore.forwardJavaQwen2MoE(this, state, token, position);
+        if (plan == null) {
+            InferenceCore.forwardJavaQwen2MoE(this, state, token, position);
+        } else {
+            InferenceCore.forwardTornadoVM(this, state, token, position, tornadoVMPlan());
+        }
     }
 
     @Override
@@ -83,6 +89,13 @@ public class Qwen2MoE extends AbstractModel {
     @Override
     public List<Integer> generateTokensGPU(State state, int startPosition, List<Integer> promptTokens, Set<Integer> stopTokens, int maxTokens, Sampler sampler, boolean echo,
             IntConsumer onTokenGenerated, TornadoVMMasterPlan tornadoVMPlan) {
-        throw new UnsupportedOperationException("GPU MoE not yet supported");
+        if (WITH_PREFILL_DECODE && TornadoVMMasterPlan.PREFILL_BATCH_SIZE > 1) {
+            throw new UnsupportedOperationException("Batch prefill/decode on GPU not yet implemented for Qwen2-MoE");
+        }
+        if (WITH_PREFILL_DECODE) {
+            throw new UnsupportedOperationException("Prefill/decode on GPU not yet implemented for Qwen2-MoE");
+        }
+        return InferenceEngine.generateTokensGPUQwen3(this, state, startPosition, promptTokens,
+                stopTokens, maxTokens, sampler, echo, onTokenGenerated, tornadoVMPlan);
     }
 }
