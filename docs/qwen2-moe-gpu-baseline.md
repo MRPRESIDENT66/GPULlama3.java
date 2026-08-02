@@ -2,7 +2,7 @@
 
 This document records the working single-token GPU baseline before further
 kernel and scheduling optimizations. The baseline is preserved on branch
-`codex/qwen2-moe-gpu-baseline`.
+`qwen2-moe-gpu-baseline`.
 
 ## Scope
 
