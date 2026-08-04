@@ -36,17 +36,29 @@ def load_objects(path: Path):
 
 def task_category(full_name: str):
     task = full_name.rsplit(".", 1)[-1]
-    if task.startswith("routed_expert_gate_up_"):
+    if task in {"routed_experts_gate_up", "batch_grouped_gate_up"} or task.startswith("routed_expert_gate_up_"):
         return "Routed Gate/Up"
-    if task.startswith("routed_expert_down_"):
+    if task in {"routed_experts_down", "batch_grouped_down", "batch_scatter_routed"} or task.startswith("routed_expert_down_"):
         return "Routed Down"
-    if task.startswith("shared_expert_"):
+    if task.startswith("shared_expert_") or task.startswith("batch_shared_"):
         return "Shared expert"
-    if task.startswith("router_"):
+    if task.startswith("router_") or task in {
+        "batch_router_projection",
+        "batch_router_topk",
+        "batch_group_experts",
+    }:
         return "Router + Top-K"
-    if task in ATTENTION_TASKS:
+    if task in ATTENTION_TASKS or task in {
+        "batch_attn_rms",
+        "batch_attn_rms_apply",
+        "batch_qkv",
+        "batch_qkv_bias",
+        "batch_rope_kv",
+        "batch_attention",
+        "batch_attn_out",
+    }:
         return "Attention"
-    if task.startswith("ffn_rms_"):
+    if task.startswith("ffn_rms_") or task.startswith("batch_ffn_rms"):
         return "FFN RMSNorm"
     return "Other"
 

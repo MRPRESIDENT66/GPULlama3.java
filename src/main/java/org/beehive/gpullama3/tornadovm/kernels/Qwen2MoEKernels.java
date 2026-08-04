@@ -103,24 +103,31 @@ public final class Qwen2MoEKernels {
      * <p>The expert matrices are stacked in one Q8_0 tensor per layer. The
      * selected expert id determines which matrix slice this kernel reads.</p>
      */
-    public static void fusedRoutedExpertGateUpSwiGLUQ8_0(
+    public static void fusedRoutedExpertsGateUpSwiGLUQ8_0(
             KernelContext context,
             FloatArray input,
             IntArray selectedExperts,
-            int slot,
             ByteArray gateExperts,
             ByteArray upExperts,
             FloatArray expertHidden,
             int dim,
             int moeHiddenDim,
             int numberOfExperts,
+            int topK,
             int localWorkGroupSize) {
 
-        int rowId = context.groupIdx;
+        int groupId = context.groupIdx;
         int localId = context.localIdx;
 
+        int slot = groupId / moeHiddenDim;
+        int rowId = groupId % moeHiddenDim;
+
+        if (slot >= topK) {
+            return;
+        }
+
         int expert = selectedExperts.get(slot);
-        if (rowId >= moeHiddenDim || expert < 0 || expert >= numberOfExperts) {
+        if (expert < 0 || expert >= numberOfExperts) {
             return;
         }
 
@@ -176,6 +183,7 @@ public final class Qwen2MoEKernels {
             context.localBarrier();
         }
         float gate = localSums[0];
+        context.localBarrier();
 
         // Reuse local memory to sum the partial up values.
         localSums[localId] = upPartialSum;
@@ -191,7 +199,8 @@ public final class Qwen2MoEKernels {
         if (localId == 0) {
             float up = localSums[0];
             float siluGate = gate / (1.0f + TornadoMath.exp(-gate));
-            expertHidden.set(rowId, siluGate * up);
+            int outputIndex = slot * moeHiddenDim + rowId;
+            expertHidden.set(outputIndex, siluGate * up);
         }
     }
 
@@ -244,7 +253,8 @@ public final class Qwen2MoEKernels {
 
             float weight = downExperts.get(quantOffset)
                     * downExperts.getHalfFloat(blockByteOffset).getFloat32();
-            partialSum += weight * expertHidden.get(column);
+            int hiddenIndex = slot * moeHiddenDim + column;
+            partialSum += weight * expertHidden.get(hiddenIndex);
         }
 
         // Combine all thread-local partial sums into the completed output row.
@@ -264,13 +274,84 @@ public final class Qwen2MoEKernels {
         }
     }
 
-    /** Computes {@code SiLU(sharedGate * input) * (sharedUp * input)}. */
+    /**
+     * Down-projects all selected experts and accumulates their weighted outputs
+     * into the residual vector in one kernel launch.
+     */
+    public static void fusedRoutedExpertsDownAndAccumulateQ8_0(
+            KernelContext context,
+            FloatArray expertHidden,
+            FloatArray residual,
+            IntArray selectedExperts,
+            FloatArray routingWeights,
+            ByteArray downExperts,
+            int dim,
+            int moeHiddenDim,
+            int numberOfExperts,
+            int topK,
+            int localWorkGroupSize) {
+
+        // One workgroup computes one output row across every selected expert.
+        int rowId = context.groupIdx;
+        int localId = context.localIdx;
+        if (rowId >= dim) {
+            return;
+        }
+
+        float partialSum = 0.0f;
+
+        for (int slot = 0; slot < topK; slot++) {
+            int expert = selectedExperts.get(slot);
+            if (expert < 0 || expert >= numberOfExperts) {
+                continue;
+            }
+
+            float routingWeight = routingWeights.get(slot);
+
+            // downExperts has logical shape [experts, dim, moeHiddenDim].
+            int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+            int rowBlockOffset = (expert * dim + rowId) * blocksPerRow;
+            int hiddenOffset = slot * moeHiddenDim;
+
+            // Each thread accumulates part of this expert's down-projection row.
+            for (int column = localId;
+                 column < moeHiddenDim;
+                 column += localWorkGroupSize) {
+                int blockByteOffset =
+                        (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
+                int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
+
+                float weight = downExperts.get(quantOffset)
+                        * downExperts.getHalfFloat(blockByteOffset).getFloat32();
+                partialSum += routingWeight * weight * expertHidden.get(hiddenOffset + column);
+            }
+        }
+
+        // One reduction combines all experts and all thread-local partial sums.
+        float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
+        localSums[localId] = partialSum;
+        context.localBarrier();
+        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
+            if (localId < stride) {
+                localSums[localId] += localSums[localId + stride];
+            }
+            context.localBarrier();
+        }
+
+        if (localId == 0) {
+            residual.set(rowId, residual.get(rowId) + localSums[0]);
+        }
+    }
+
+    /** Computes the shared expert hidden vector and its scalar routing weight. */
     public static void sharedExpertGateUpSwiGLUQ8_0(
             KernelContext context,
             FloatArray input,
             ByteArray sharedGate,
             ByteArray sharedUp,
             FloatArray sharedHidden,
+            FloatArray sharedGateInput,
+            FloatArray sharedWeight,
             int dim,
             int sharedExpertHiddenDim,
             int localWorkGroupSize) {
@@ -291,6 +372,7 @@ public final class Qwen2MoEKernels {
 
         float gatePartialSum = 0.0f;
         float upPartialSum = 0.0f;
+        float sharedGateScorePartial = 0.0f;
 
         for (int column = localId;
              column < dim;
@@ -321,7 +403,9 @@ public final class Qwen2MoEKernels {
 
             gatePartialSum += gateWeight * inputValue;
             upPartialSum += upWeight * inputValue;
-
+            if (rowId == 0) {
+                sharedGateScorePartial += sharedGateInput.get(column) * inputValue;
+            }
 
         }
 
@@ -338,6 +422,7 @@ public final class Qwen2MoEKernels {
         }
 
         float gate = localSums[0];
+        context.localBarrier();
 
         // Reuse local memory to sum the partial up values.
         localSums[localId] = upPartialSum;
@@ -355,14 +440,33 @@ public final class Qwen2MoEKernels {
             float siluGate = gate / (1.0f + TornadoMath.exp(-gate));
             sharedHidden.set(rowId, siluGate * up);
         }
+
+        // Only workgroup zero computes the scalar shared-expert routing weight.
+        // The next TaskGraph task starts only after all workgroups in this task finish.
+        if (rowId == 0) {
+            context.localBarrier();
+            localSums[localId] = sharedGateScorePartial;
+            context.localBarrier();
+            for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
+                if (localId < stride) {
+                    localSums[localId] += localSums[localId + stride];
+                }
+                context.localBarrier();
+            }
+            if (localId == 0) {
+                float gateScore = localSums[0];
+                sharedWeight.set(0, 1.0f / (1.0f + TornadoMath.exp(-gateScore)));
+            }
+        }
     }
 
-    /** Down-projects the shared expert hidden vector into the model dimension. */
-    public static void sharedExpertDownProjectQ8_0(
+    /** Down-projects the shared hidden vector and directly accumulates it into the residual. */
+    public static void sharedExpertDownAndAccumulateQ8_0(
             KernelContext context,
             FloatArray sharedHidden,
             ByteArray sharedDown,
-            FloatArray sharedOutput,
+            FloatArray sharedWeight,
+            FloatArray residual,
             int dim,
             int sharedExpertHiddenDim,
             int localWorkGroupSize) {
@@ -410,7 +514,7 @@ public final class Qwen2MoEKernels {
 
         if (localId == 0) {
             float outputValue = localSums[0];
-            sharedOutput.set(rowId, outputValue);
+            residual.set(rowId, residual.get(rowId) + sharedWeight.get(0) * outputValue);
         }
     }
 

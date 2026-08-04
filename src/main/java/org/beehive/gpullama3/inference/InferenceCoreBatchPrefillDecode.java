@@ -2,12 +2,14 @@ package org.beehive.gpullama3.inference;
 
 import org.beehive.gpullama3.auxiliary.Parallel;
 import org.beehive.gpullama3.inference.state.State;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.weights.standard.StandardWeights;
 import org.beehive.gpullama3.inference.weights.tornado.TornadoWeights;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.Model;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
 import org.beehive.gpullama3.tensor.standard.FloatTensor;
+import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlanBatchPrefillDecode;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 
@@ -194,6 +196,9 @@ public final class InferenceCoreBatchPrefillDecode {
         final TornadoWeights weights = (TornadoWeights) model.weights();
 
         state.batchStartPosHolder.set(0, startPos);
+        if (state instanceof Qwen2MoEState moeState && moeState.activeBatchSizeHolder != null) {
+            moeState.activeBatchSizeHolder.set(0, chunkSize);
+        }
 
         switch (weights.getWeightType()) {
             case F16 -> {
@@ -214,6 +219,15 @@ public final class InferenceCoreBatchPrefillDecode {
                         float scale = embTable.getHalfFloat(blockByteOffset).getFloat32();
                         float quant = embTable.get(blockByteOffset + 2 + j % Q8_0_BLOCK_SIZE);
                         state.wrapXBatch.set(b * dim + j, quant * scale);
+                    }
+                }
+                // The TaskGraph keeps a fixed maximum batch size. Do not let rows
+                // left over from the previous chunk become padding tokens here.
+                int configuredBatchSize = TornadoVMMasterPlan.PREFILL_BATCH_SIZE;
+                for (int b = chunkSize; b < configuredBatchSize; b++) {
+                    int rowOffset = b * dim;
+                    for (int j = 0; j < dim; j++) {
+                        state.wrapXBatch.set(rowOffset + j, 0.0f);
                     }
                 }
             }
@@ -244,6 +258,9 @@ public final class InferenceCoreBatchPrefillDecode {
     public static FloatArray forwardTornadoVMDecode(Model model, State state, int token, int position, TornadoVMMasterPlanBatchPrefillDecode plan) {
         final Configuration config = model.configuration();
         final TornadoWeights weights = (TornadoWeights) model.weights();
+        if (state instanceof Qwen2MoEState moeState && moeState.activeBatchSizeHolder != null) {
+            moeState.activeBatchSizeHolder.set(0, 1);
+        }
 
         switch (weights.getWeightType()) {
             case F16 -> {
@@ -251,10 +268,30 @@ public final class InferenceCoreBatchPrefillDecode {
                 MemorySegment.copy(embTable, (long) token * config.dim() * Short.BYTES, state.embeddingX.getSegment(), 0L, (long) config.dim() * Short.BYTES);
             }
             case Q8_0 -> {
-                MemorySegment embTable = weights.getTokenEmbeddingTable().asByteArray().getSegment();
+                var embeddingTable = weights.getTokenEmbeddingTable().asByteArray();
                 int blocksPerToken = (config.dim() + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-                long bytesPerToken = (long) blocksPerToken * Q8_0_BLOCK_BYTES;
-                MemorySegment.copy(embTable, (long) token * bytesPerToken, state.embeddingX.getSegment(), 0L, bytesPerToken);
+                if (plan.usesFixedBatchMoEDecode()) {
+                    for (int column = 0; column < config.dim(); column++) {
+                        int blockByteOffset = (token * blocksPerToken + column / Q8_0_BLOCK_SIZE)
+                                * Q8_0_BLOCK_BYTES;
+                        float scale = embeddingTable.getHalfFloat(blockByteOffset).getFloat32();
+                        float quant = embeddingTable.get(
+                                blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE);
+                        state.wrapXBatch.set(column, quant * scale);
+                    }
+                    // Decode has one real token. Clear the unused fixed-batch rows.
+                    for (int b = 1; b < TornadoVMMasterPlan.PREFILL_BATCH_SIZE; b++) {
+                        int rowOffset = b * config.dim();
+                        for (int column = 0; column < config.dim(); column++) {
+                            state.wrapXBatch.set(rowOffset + column, 0.0f);
+                        }
+                    }
+                } else {
+                    MemorySegment embTable = embeddingTable.getSegment();
+                    long bytesPerToken = (long) blocksPerToken * Q8_0_BLOCK_BYTES;
+                    MemorySegment.copy(embTable, (long) token * bytesPerToken,
+                            state.embeddingX.getSegment(), 0L, bytesPerToken);
+                }
             }
             default -> throw new IllegalArgumentException("Unsupported weight type: " + weights.getWeightType());
         }

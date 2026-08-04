@@ -60,6 +60,29 @@ public final class MoECorrectnessTrace {
         writeLine("}");
     }
 
+    /**
+     * Records one router decision per active token from a batched MoE graph.
+     * The arrays are laid out as contiguous token rows after a trace-only
+     * device-to-host transfer.
+     */
+    public static void recordGpuBatchRouter(int firstPosition, int layer,
+                                            FloatArray logits, IntArray experts,
+                                            FloatArray weights, int tokenCount,
+                                            int numberOfExperts, int topK) {
+        if (!ENABLED) {
+            return;
+        }
+        for (int token = 0; token < tokenCount; token++) {
+            writeRouterPrefix(firstPosition + token, layer);
+            writeFloatArraySlice(logits, token * numberOfExperts, numberOfExperts);
+            write(",\"experts\":");
+            writeIntArraySlice(experts, token * topK, topK);
+            write(",\"weights\":");
+            writeFloatArraySlice(weights, token * topK, topK);
+            writeLine("}");
+        }
+    }
+
     public static void recordCpuLogits(int position, FloatTensor logits) {
         if (!ENABLED) {
             return;
@@ -139,6 +162,17 @@ public final class MoECorrectnessTrace {
         write("]");
     }
 
+    private static void writeFloatArraySlice(FloatArray values, int offset, int length) {
+        write("[");
+        for (int i = 0; i < length; i++) {
+            if (i > 0) {
+                write(",");
+            }
+            write(Float.toString(values.get(offset + i)));
+        }
+        write("]");
+    }
+
     private static void writeFloatArray(float[] values) {
         write("[");
         for (int i = 0; i < values.length; i++) {
@@ -157,6 +191,17 @@ public final class MoECorrectnessTrace {
                 write(",");
             }
             write(Integer.toString(values.get(i)));
+        }
+        write("]");
+    }
+
+    private static void writeIntArraySlice(IntArray values, int offset, int length) {
+        write("[");
+        for (int i = 0; i < length; i++) {
+            if (i > 0) {
+                write(",");
+            }
+            write(Integer.toString(values.get(offset + i)));
         }
         write("]");
     }

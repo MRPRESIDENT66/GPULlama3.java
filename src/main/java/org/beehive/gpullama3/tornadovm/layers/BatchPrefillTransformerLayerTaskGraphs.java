@@ -15,5 +15,13 @@ public interface BatchPrefillTransformerLayerTaskGraphs {
 
     void updateGridScheduler(GridScheduler scheduler);
 
+    /**
+     * Updates batch-layer WorkerGrids for a runtime batch size.
+     * Implementations that do not support dynamic sizing keep their normal grids.
+     */
+    default void updateGridScheduler(GridScheduler scheduler, int runtimeBatchSize) {
+        updateGridScheduler(scheduler);
+    }
+
     String getLastLayerTaskGraphID();
 }

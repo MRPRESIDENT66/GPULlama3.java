@@ -2,6 +2,7 @@ package org.beehive.gpullama3.model.qwen2;
 
 import org.beehive.gpullama3.inference.InferenceCore;
 import org.beehive.gpullama3.inference.InferenceEngine;
+import org.beehive.gpullama3.inference.InferenceEngineWithBatchPrefillDecode;
 import org.beehive.gpullama3.inference.sampler.Sampler;
 import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.state.State;
@@ -90,7 +91,9 @@ public class Qwen2MoE extends AbstractModel {
     public List<Integer> generateTokensGPU(State state, int startPosition, List<Integer> promptTokens, Set<Integer> stopTokens, int maxTokens, Sampler sampler, boolean echo,
             IntConsumer onTokenGenerated, TornadoVMMasterPlan tornadoVMPlan) {
         if (WITH_PREFILL_DECODE && TornadoVMMasterPlan.PREFILL_BATCH_SIZE > 1) {
-            throw new UnsupportedOperationException("Batch prefill/decode on GPU not yet implemented for Qwen2-MoE");
+            return InferenceEngineWithBatchPrefillDecode.generateTokensGPULlama(
+                    this, state, startPosition, promptTokens, stopTokens, maxTokens,
+                    sampler, echo, onTokenGenerated, tornadoVMPlan);
         }
         if (WITH_PREFILL_DECODE) {
             throw new UnsupportedOperationException("Prefill/decode on GPU not yet implemented for Qwen2-MoE");

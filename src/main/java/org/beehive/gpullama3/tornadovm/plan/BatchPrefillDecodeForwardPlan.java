@@ -33,19 +33,21 @@ import java.util.List;
 public class BatchPrefillDecodeForwardPlan extends ForwardPlan {
 
     private final BatchPrefillDecodeForwardTaskGraphLayout taskGraphLayout;
+    private final BatchPrefillTransformerLayerTaskGraphs batchLayers;
+    private final GridScheduler scheduler;
 
     public BatchPrefillDecodeForwardPlan(Model model, BatchPrefillDecodeForwardPlanComponents components, int batchSize) {
         int N = model.configuration().numberOfLayers();
         this.taskGraphLayout = new BatchPrefillDecodeForwardTaskGraphLayout(N);
 
         List<ImmutableTaskGraph> all = new ArrayList<>(2 * N + 3);
-        GridScheduler scheduler = new GridScheduler();
+        this.scheduler = new GridScheduler();
 
         ActivationTaskGraph batchAct = components.batchPrefillActivation(batchSize);
         all.add(batchAct.getImmutableTaskGraph());
         batchAct.updateGridScheduler(scheduler);
 
-        BatchPrefillTransformerLayerTaskGraphs batchLayers = components.batchPrefillTransformerLayers(batchSize);
+        this.batchLayers = components.batchPrefillTransformerLayers(batchSize);
         all.addAll(batchLayers.getLayerImmutableTaskGraphs());
         batchLayers.updateGridScheduler(scheduler);
 
@@ -62,6 +64,11 @@ public class BatchPrefillDecodeForwardPlan extends ForwardPlan {
         logits.updateGridScheduler(scheduler);
 
         setGraphs(all, scheduler);
+    }
+
+    /** Replaces batch-layer grids while reusing the same compiled TaskGraphs and buffers. */
+    public void updateBatchLayerGridScheduler(int runtimeBatchSize) {
+        batchLayers.updateGridScheduler(scheduler, runtimeBatchSize);
     }
 
     public BatchPrefillDecodeForwardTaskGraphLayout getTaskGraphLayout() {

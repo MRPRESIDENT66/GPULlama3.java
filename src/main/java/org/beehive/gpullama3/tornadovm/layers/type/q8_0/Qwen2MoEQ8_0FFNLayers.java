@@ -25,10 +25,10 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
  * routed-expert pipeline: normalize, route, choose top-K experts, execute each
  * selected expert, and accumulate its weighted output into {@code wrapX}.</p>
  */
-public final class Qwen2MoEQ8_0FFNLayers
+public class Qwen2MoEQ8_0FFNLayers
         extends AbstractTransformerLayerTaskGraphs<Qwen2MoETornadoWeights, Qwen2MoEConfiguration> {
 
-    private final Qwen2MoEState moeState;
+    protected final Qwen2MoEState moeState;
 
     public Qwen2MoEQ8_0FFNLayers(String taskGraphName,
                                   Qwen2MoEState state,
@@ -68,7 +68,9 @@ public final class Qwen2MoEQ8_0FFNLayers
         routerCopyWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC, 1, 1);
         WorkerGrid topKWorker = new WorkerGrid1D(LOCAL_WORK_GROUP_SIZE_ALLOC);
         topKWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC, 1, 1);
-        WorkerGrid expertHiddenWorker = workerForRows(config.moeHiddenDim());
+        WorkerGrid routedExpertsHiddenWorker = workerForRows(
+                config.numberOfExpertsUsed() * config.moeHiddenDim()
+        );
         WorkerGrid sharedHiddenWorker = workerForRows(config.sharedExpertHiddenDim());
 
         for (int layer = 0; layer < config.numberOfLayers(); layer++) {
@@ -86,13 +88,10 @@ public final class Qwen2MoEQ8_0FFNLayers
                 scheduler.addWorkerGrid(prefix + "router_trace_copy", routerCopyWorker);
             }
             scheduler.addWorkerGrid(prefix + "router_softmax_topk", topKWorker);
-            for (int slot = 0; slot < config.numberOfExpertsUsed(); slot++) {
-                scheduler.addWorkerGrid(prefix + "routed_expert_gate_up_" + slot, expertHiddenWorker);
-                scheduler.addWorkerGrid(prefix + "routed_expert_down_" + slot, dimWorker);
-            }
+            scheduler.addWorkerGrid(prefix + "routed_experts_gate_up", routedExpertsHiddenWorker);
+            scheduler.addWorkerGrid(prefix + "routed_experts_down", dimWorker);
             scheduler.addWorkerGrid(prefix + "shared_expert_gate_up", sharedHiddenWorker);
             scheduler.addWorkerGrid(prefix + "shared_expert_down", dimWorker);
-            scheduler.addWorkerGrid(prefix + "shared_expert_gate_and_accumulate", topKWorker);
         }
         return scheduler;
     }
@@ -112,8 +111,40 @@ public final class Qwen2MoEQ8_0FFNLayers
     protected TaskGraph createFFNLayerTaskGraph(int layerIndex) {
         TaskGraph layer = new TaskGraph("layer_" + layerIndex);
         // Reuse wrapX produced by the previous TaskGraph on the GPU.
-        layer.consumeFromDevice(moeState.wrapX);
-        // Upload this layer's read-only weights from CPU to GPU on the first execution.
+        String predecessor = predecessorGraphName(layerIndex);
+        if (predecessor == null) {
+            layer.consumeFromDevice(moeState.wrapX);
+        } else {
+            layer.consumeFromDevice(predecessor, moeState.wrapX);
+        }
+        // Upload or reuse this layer's read-only weights.
+        configureLayerWeights(layer, layerIndex);
+        layer = configureLayerDataTransfers(layer, layerIndex);
+
+        configureAttention(layer, layerIndex);
+        configureRoutedExperts(layer, layerIndex);
+        persistLayerState(layer);
+        return layer;
+    }
+
+    /** Keeps reusable activations and metadata alive for the next layer graph. */
+    protected void persistLayerState(TaskGraph layer) {
+        layer.persistOnDevice(
+                context,
+                moeState.wrapX, moeState.wrapXb, moeState.wrapXb2,
+                moeState.wrapQ, moeState.wrapK, moeState.wrapV,
+                moeState.wrapKeyCache, moeState.wrapValueCache, moeState.wrapAtt,
+                moeState.wrapRouterLogits, moeState.wrapSelectedExperts,
+                moeState.wrapRoutingWeights, moeState.wrapExpertGate,
+                moeState.wrapSharedGate, moeState.wrapSharedWeight,
+                moeState.positionHolder, moeState.temp, moeState.tempFFN);
+        if (MoECorrectnessTrace.isEnabled()) {
+            layer.persistOnDevice(moeState.wrapRawRouterLogits);
+        }
+    }
+
+    /** Uploads this layer's weights for the normal single-token plan. */
+    protected void configureLayerWeights(TaskGraph layer, int layerIndex) {
         layer.transferToDevice(DataTransferMode.FIRST_EXECUTION,
                 weights.rms_att_weightLayered[layerIndex].asFloatArray(),
                 weights.wqLayered[layerIndex].asByteArray(),
@@ -132,12 +163,11 @@ public final class Qwen2MoEQ8_0FFNLayers
                 weights.sharedUpLayered[layerIndex].asByteArray(),
                 weights.sharedDownLayered[layerIndex].asByteArray(),
                 weights.sharedGateInputLayered[layerIndex].asFloatArray());
-        layer = configureLayerDataTransfers(layer, layerIndex);
+    }
 
-        configureAttention(layer, layerIndex);
-        configureRoutedExperts(layer, layerIndex);
-        layer.persistOnDevice(moeState.wrapX);
-        return layer;
+    /** Returns the graph that owns the input activation for this layer. */
+    protected String predecessorGraphName(int layerIndex) {
+        return layerIndex == 0 ? null : "layer_" + (layerIndex - 1);
     }
 
     /** Adds the normal Qwen2 attention tasks to this layer's TaskGraph. */
@@ -226,37 +256,50 @@ public final class Qwen2MoEQ8_0FFNLayers
                 context, moeState.wrapRouterLogits, moeState.wrapSelectedExperts,
                 moeState.wrapRoutingWeights, config.numberOfExperts(), config.numberOfExpertsUsed());
 
-        for (int slot = 0; slot < config.numberOfExpertsUsed(); slot++) {
-            layer.task("routed_expert_gate_up_" + slot,
-                    Qwen2MoEKernels::fusedRoutedExpertGateUpSwiGLUQ8_0,
-                    context, moeState.wrapXb, moeState.wrapSelectedExperts, slot,
-                    weights.gateExpertsLayered[layerIndex].asByteArray(),
-                    weights.upExpertsLayered[layerIndex].asByteArray(), moeState.wrapExpertGate,
-                    config.dim(), config.moeHiddenDim(), config.numberOfExperts(), LOCAL_WORK_GROUP_SIZE_ALLOC);
+        layer.task(
+                "routed_experts_gate_up",
+                Qwen2MoEKernels::fusedRoutedExpertsGateUpSwiGLUQ8_0,
+                context,
+                moeState.wrapXb,
+                moeState.wrapSelectedExperts,
+                weights.gateExpertsLayered[layerIndex].asByteArray(),
+                weights.upExpertsLayered[layerIndex].asByteArray(),
+                moeState.wrapExpertGate,
+                config.dim(),
+                config.moeHiddenDim(),
+                config.numberOfExperts(),
+                config.numberOfExpertsUsed(),
+                LOCAL_WORK_GROUP_SIZE_ALLOC
+        );
 
-            layer.task("routed_expert_down_" + slot,
-                    Qwen2MoEKernels::routedExpertDownProjectAndAccumulateQ8_0,
-                    context, moeState.wrapExpertGate, moeState.wrapX,
-                    moeState.wrapSelectedExperts, moeState.wrapRoutingWeights, slot,
-                    weights.downExpertsLayered[layerIndex].asByteArray(),
-                    config.dim(), config.moeHiddenDim(), config.numberOfExperts(), LOCAL_WORK_GROUP_SIZE_ALLOC);
-        }
+        layer.task(
+                "routed_experts_down",
+                Qwen2MoEKernels::fusedRoutedExpertsDownAndAccumulateQ8_0,
+                context,
+                moeState.wrapExpertGate,
+                moeState.wrapX,
+                moeState.wrapSelectedExperts,
+                moeState.wrapRoutingWeights,
+                weights.downExpertsLayered[layerIndex].asByteArray(),
+                config.dim(),
+                config.moeHiddenDim(),
+                config.numberOfExperts(),
+                config.numberOfExpertsUsed(),
+                LOCAL_WORK_GROUP_SIZE_ALLOC
+        );
 
         // The shared expert always runs; it does not depend on router top-K selection.
         layer.task("shared_expert_gate_up", Qwen2MoEKernels::sharedExpertGateUpSwiGLUQ8_0,
                 context, moeState.wrapXb,
                 weights.sharedGateLayered[layerIndex].asByteArray(),
                 weights.sharedUpLayered[layerIndex].asByteArray(), moeState.wrapSharedGate,
+                weights.sharedGateInputLayered[layerIndex].asFloatArray(), moeState.wrapSharedWeight,
                 config.dim(), config.sharedExpertHiddenDim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
-        layer.task("shared_expert_down", Qwen2MoEKernels::sharedExpertDownProjectQ8_0,
+        layer.task("shared_expert_down", Qwen2MoEKernels::sharedExpertDownAndAccumulateQ8_0,
                 context, moeState.wrapSharedGate,
-                weights.sharedDownLayered[layerIndex].asByteArray(), moeState.wrapSharedOutput,
+                weights.sharedDownLayered[layerIndex].asByteArray(), moeState.wrapSharedWeight, moeState.wrapX,
                 config.dim(), config.sharedExpertHiddenDim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
-
-        layer.task("shared_expert_gate_and_accumulate", Qwen2MoEKernels::sharedExpertGateAndAccumulate,
-                context, moeState.wrapXb, weights.sharedGateInputLayered[layerIndex].asFloatArray(),
-                moeState.wrapSharedOutput, moeState.wrapX, config.dim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         if (MoECorrectnessTrace.isEnabled()) {
             layer.transferToHost(DataTransferMode.EVERY_EXECUTION,
@@ -278,21 +321,24 @@ public final class Qwen2MoEQ8_0FFNLayers
                     moeState.wrapK, moeState.wrapV, moeState.wrapKeyCache,
                     moeState.wrapValueCache, moeState.wrapAtt, moeState.wrapRouterLogits,
                     moeState.wrapSelectedExperts, moeState.wrapRoutingWeights,
-                    moeState.wrapExpertGate, moeState.wrapSharedGate, moeState.wrapSharedOutput);
+                    moeState.wrapExpertGate, moeState.wrapSharedGate, moeState.wrapSharedWeight);
         } else {
-            layer.consumeFromDevice(context, moeState.wrapXb, moeState.wrapXb2,
+            String predecessor = "layer_" + (layerIndex - 1);
+            layer.consumeFromDevice(predecessor,
+                    context, moeState.wrapXb, moeState.wrapXb2,
                     moeState.wrapQ, moeState.wrapK, moeState.wrapV, moeState.wrapKeyCache,
                     moeState.wrapValueCache, moeState.wrapAtt, moeState.wrapRouterLogits,
                     moeState.wrapSelectedExperts, moeState.wrapRoutingWeights,
-                    moeState.wrapExpertGate, moeState.wrapSharedGate, moeState.wrapSharedOutput,
-                    moeState.positionHolder);
+                    moeState.wrapExpertGate, moeState.wrapSharedGate, moeState.wrapSharedWeight,
+                    moeState.positionHolder, moeState.temp, moeState.tempFFN);
         }
         if (MoECorrectnessTrace.isEnabled()) {
             if (layerIndex == 0) {
                 layer.transferToDevice(DataTransferMode.FIRST_EXECUTION,
                         moeState.wrapRawRouterLogits);
             } else {
-                layer.consumeFromDevice(moeState.wrapRawRouterLogits);
+                layer.consumeFromDevice("layer_" + (layerIndex - 1),
+                        moeState.wrapRawRouterLogits);
             }
         }
         return layer;

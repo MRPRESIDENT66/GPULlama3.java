@@ -52,6 +52,40 @@ public final class TransformerBatchPrefillKernels {
     }
 
     /**
+     * Parallel RMS reduction for a batch path that provides one work-group per
+     * token. Each thread sums a stride of the input vector before the group
+     * reduces those partial sums into one scale value.
+     */
+    public static void batchedRmsReduceParallel(KernelContext context,
+                                                 FloatArray wrapXBatch,
+                                                 FloatArray attnScaleBatch,
+                                                 int dim, float eps,
+                                                 int localWorkGroupSize) {
+        int batchIndex = context.groupIdx;
+        int localId = context.localIdx;
+        int base = batchIndex * dim;
+        float partial = 0.0f;
+        for (int i = localId; i < dim; i += localWorkGroupSize) {
+            float value = wrapXBatch.get(base + i);
+            partial += value * value;
+        }
+
+        float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
+        localSums[localId] = partial;
+        context.localBarrier();
+        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
+            if (localId < stride) {
+                localSums[localId] += localSums[localId + stride];
+            }
+            context.localBarrier();
+        }
+        if (localId == 0) {
+            float meanSquare = localSums[0] / dim + eps;
+            attnScaleBatch.set(batchIndex, 1.0f / TornadoMath.sqrt(meanSquare));
+        }
+    }
+
+    /**
      * Applies RMS normalization and FP16-quantizes the result.
      *
      * <p>{@code xbFP16Batch[b*dim+i] = FP16( rmsWeights[i] * scale[b] * x[b*dim+i] )}</p>
@@ -405,6 +439,36 @@ public final class TransformerBatchPrefillKernels {
         ss /= dim;
         ss += eps;
         ffnScaleBatch.set(b, 1.0f / TornadoMath.sqrt(ss));
+    }
+
+    /** Parallel version of the FFN RMS reduction, one work-group per token. */
+    public static void batchedFFNRmsReduceParallel(KernelContext context,
+                                                    FloatArray wrapXBatch,
+                                                    FloatArray ffnScaleBatch,
+                                                    int dim, float eps,
+                                                    int localWorkGroupSize) {
+        int batchIndex = context.groupIdx;
+        int localId = context.localIdx;
+        int base = batchIndex * dim;
+        float partial = 0.0f;
+        for (int i = localId; i < dim; i += localWorkGroupSize) {
+            float value = wrapXBatch.get(base + i);
+            partial += value * value;
+        }
+
+        float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
+        localSums[localId] = partial;
+        context.localBarrier();
+        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
+            if (localId < stride) {
+                localSums[localId] += localSums[localId + stride];
+            }
+            context.localBarrier();
+        }
+        if (localId == 0) {
+            float meanSquare = localSums[0] / dim + eps;
+            ffnScaleBatch.set(batchIndex, 1.0f / TornadoMath.sqrt(meanSquare));
+        }
     }
 
     // ── FFN SwiGLU ───────────────────────────────────────────────────────────

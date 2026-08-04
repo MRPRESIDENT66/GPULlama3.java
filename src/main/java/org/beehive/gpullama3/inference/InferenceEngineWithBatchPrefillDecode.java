@@ -8,6 +8,7 @@ import org.beehive.gpullama3.model.Model;
 import org.beehive.gpullama3.tokenizer.Tokenizer;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlanBatchPrefillDecode;
+import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -123,6 +124,7 @@ public final class InferenceEngineWithBatchPrefillDecode {
             }
 
             generatedTokens.add(nextToken);
+            MoECorrectnessTrace.recordToken(nextToken);
 
             if (onTokenGenerated != null) {
                 onTokenGenerated.accept(nextToken);
@@ -187,13 +189,20 @@ public final class InferenceEngineWithBatchPrefillDecode {
         int N = promptTokens.size();
 
         // ── Prefill ───────────────────────────────────────────────────────────
-        // Build the token sequence at positions [startPosition .. startPosition+N-1]:
-        //   position startPosition+0 : currentToken (BOS/previous token)
-        //   position startPosition+k : promptTokens[k-1]
+        // Qwen's regular single-token path forwards promptTokens[0] at position
+        // zero. Unlike Llama's BOS convention, inserting currentToken here would
+        // duplicate the ChatML start-header token and shift every later position.
+        // Preserve the existing Llama convention while matching the Qwen path.
         int[] prefillSeq = new int[N];
-        prefillSeq[0] = currentToken;
-        for (int i = 1; i < N; i++) {
-            prefillSeq[i] = promptTokens.get(i - 1);
+        if (model.getModelType() == org.beehive.gpullama3.model.ModelType.QWEN_2_MOE) {
+            for (int i = 0; i < N; i++) {
+                prefillSeq[i] = promptTokens.get(i);
+            }
+        } else {
+            prefillSeq[0] = currentToken;
+            for (int i = 1; i < N; i++) {
+                prefillSeq[i] = promptTokens.get(i - 1);
+            }
         }
 
         for (int chunkStart = 0; chunkStart < N && pos + chunkStart < actualMaxTokens; chunkStart += batchSize) {
@@ -218,6 +227,37 @@ public final class InferenceEngineWithBatchPrefillDecode {
         long decodeStartNanos = System.nanoTime();
 
         // ── Decode ────────────────────────────────────────────────────────────
+        if (plan.usesFixedBatchMoEDecode()) {
+            // The final prefill row already contains the last prompt token's
+            // hidden state. Use its logits for the first generated token rather
+            // than forwarding that prompt token a second time.
+            var logits = plan.tornadoVMForwardBatchPrefillLogits(pos - 1);
+            int nextToken = sampler.sampleToken(logits);
+
+            if (echo) {
+                System.err.print(Tokenizer.replaceControlCharacters(
+                        model.tokenizer().decode(List.of(nextToken))));
+            }
+
+            generatedTokens.add(nextToken);
+            MoECorrectnessTrace.recordToken(nextToken);
+            if (onTokenGenerated != null) {
+                onTokenGenerated.accept(nextToken);
+            }
+            if (stopTokens.contains(nextToken)) {
+                long endNanos = System.nanoTime();
+                RunMetrics.setInferenceMetrics(promptTokens.size(), decodeStartNanos - startNanos,
+                        generatedTokens.size(), endNanos - decodeStartNanos, endNanos - startNanos);
+                RunMetrics.setHasPrefillPhase(true);
+                return generatedTokens;
+            }
+
+            currentToken = nextToken;
+            state.latestToken = currentToken;
+            // Match the existing Qwen sequential decode-position convention.
+            pos++;
+        }
+
         while (pos < actualMaxTokens) {
             var logits = InferenceCoreBatchPrefillDecode.forwardTornadoVMDecode(model, state, currentToken, pos, plan);
             int nextToken = sampler.sampleToken(logits);
@@ -228,6 +268,7 @@ public final class InferenceEngineWithBatchPrefillDecode {
             }
 
             generatedTokens.add(nextToken);
+            MoECorrectnessTrace.recordToken(nextToken);
 
             if (onTokenGenerated != null) {
                 onTokenGenerated.accept(nextToken);

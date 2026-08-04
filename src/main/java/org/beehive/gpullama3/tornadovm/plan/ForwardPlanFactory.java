@@ -179,9 +179,14 @@ public class ForwardPlanFactory {
     }
 
     private static ForwardPlan createQwen2MoEQ8_0Plan(ExecutionMode mode, Qwen2MoEState state, Model model) {
-        if (mode != ExecutionMode.STANDARD)
-            throw new UnsupportedOperationException(mode + " not yet supported for QWEN_2_MOE + Q8_0");
-        return new SingleTokenForwardPlan(model, new Qwen2MoEQ8_0PlanComponents(state, model));
+        BatchPrefillDecodeForwardPlanComponents components = new Qwen2MoEQ8_0PlanComponents(state, model);
+        return switch (mode) {
+            case STANDARD -> new SingleTokenForwardPlan(model, components);
+            case PREFILL_DECODE -> throw new UnsupportedOperationException(
+                    mode + " not yet supported for QWEN_2_MOE + Q8_0");
+            case BATCH_PREFILL_DECODE -> new BatchPrefillDecodeForwardPlan(
+                    model, components, TornadoVMMasterPlan.PREFILL_BATCH_SIZE);
+        };
     }
 
     private static ForwardPlan createQwen3FP16Plan(ExecutionMode mode, Qwen3State state, Model model) {

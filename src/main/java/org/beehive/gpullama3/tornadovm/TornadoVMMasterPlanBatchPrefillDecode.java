@@ -1,13 +1,17 @@
 package org.beehive.gpullama3.tornadovm;
 
 import org.beehive.gpullama3.auxiliary.RunMetrics;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.state.State;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.Model;
+import org.beehive.gpullama3.model.ModelType;
+import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.GGMLType;
 import org.beehive.gpullama3.tornadovm.plan.BatchPrefillDecodeForwardPlan;
 import org.beehive.gpullama3.tornadovm.plan.ForwardPlanFactory;
 import org.beehive.gpullama3.tornadovm.plan.layout.BatchPrefillDecodeForwardTaskGraphLayout;
+import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
@@ -38,6 +42,8 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
     BatchPrefillDecodeForwardPlan batchPrefillDecodeForwardPlan;
     BatchPrefillDecodeForwardTaskGraphLayout taskGraphLayout;
     public TornadoExecutionPlan executionPlan;
+    private final boolean fixedBatchMoEDecode;
+    private boolean initializationComplete;
 
     // ── Construction ─────────────────────────────────────────────────────────
     TornadoVMMasterPlanBatchPrefillDecode(State initialState, Model model) {
@@ -48,6 +54,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
         this.state = initialState;
         this.model = model;
         this.config = model.configuration();
+        this.fixedBatchMoEDecode = model.getModelType() == ModelType.QWEN_2_MOE;
 
         long startTime = System.nanoTime();
         this.executionPlan = createExecutionPlan();
@@ -60,6 +67,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
         long warmupTime = System.nanoTime();
 
         forceCopyInReadOnlyData();
+        this.initializationComplete = true;
         long copyTime = System.nanoTime();
 
         RunMetrics.setTornadoMetrics(planCreationTime - startTime, warmupTime - planCreationTime, copyTime - warmupTime);
@@ -105,6 +113,15 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
      */
     // @formatter:off
     public void tornadoVMForwardBatchPrefill() {
+        executeBatchMoE(TornadoVMMasterPlan.PREFILL_BATCH_SIZE);
+    }
+
+    /** Executes the fixed graph with a selected runtime batch size. */
+    private void executeBatchMoE(int runtimeBatchSize) {
+        if (fixedBatchMoEDecode) {
+            batchPrefillDecodeForwardPlan.updateBatchLayerGridScheduler(runtimeBatchSize);
+        }
+
         var batchAct = executionPlan.withGraph(taskGraphLayout.batchActivationIdx())
                                     .withGridScheduler(batchPrefillDecodeForwardPlan.getGridScheduler());
         if (CUDA_GRAPHS) {
@@ -119,9 +136,23 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
                 batchLayer.withCUDAGraph();
             }
             batchLayer.execute();
+            recordBatchRouterTrace(l);
         }
     }
     // @formatter:on
+
+    /** True when decode intentionally reuses the fixed-size batch TaskGraphs. */
+    public boolean usesFixedBatchMoEDecode() {
+        return fixedBatchMoEDecode;
+    }
+
+    /** Produces logits for the last token already processed by batch prefill. */
+    public FloatArray tornadoVMForwardBatchPrefillLogits(int position) {
+        if (!fixedBatchMoEDecode) {
+            throw new UnsupportedOperationException("Batch-prefill logits are currently Qwen2-MoE only");
+        }
+        return runDecodeRelayAndLogits(position);
+    }
 
     /**
      * Single-token decode: runs graphs N+1..2N+2 (activation + N layers + logits).
@@ -134,6 +165,10 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
     // @formatter:off
     @Override
     public FloatArray tornadoVMForwardDecode(int position) {
+        if (fixedBatchMoEDecode) {
+            return tornadoVMForwardFixedBatchMoEDecode(position);
+        }
+
         state.positionHolder.set(0, position);
         state.temp.clear();
         state.tempFFN.clear();
@@ -163,10 +198,62 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
             logits.withCUDAGraph();
         }
         logits.execute();
+        MoECorrectnessTrace.recordGpuLogits(position, state.wrapLogits);
 
         return state.wrapLogits;
     }
     // @formatter:on
+
+    private FloatArray tornadoVMForwardFixedBatchMoEDecode(int position) {
+        state.batchStartPosHolder.set(0, position);
+        executeBatchMoE(1);
+
+        return runDecodeRelayAndLogits(position);
+    }
+
+    private FloatArray runDecodeRelayAndLogits(int position) {
+        var decodeActivation = executionPlan.withGraph(taskGraphLayout.decodeActivationIdx())
+                .withGridScheduler(batchPrefillDecodeForwardPlan.getGridScheduler());
+        if (CUDA_GRAPHS) {
+            decodeActivation.withCUDAGraph();
+        }
+        decodeActivation.execute();
+
+        for (int layer = 0; layer < config.numberOfLayers(); layer++) {
+            var relay = executionPlan.withGraph(taskGraphLayout.decodeLayerIdx(layer))
+                    .withGridScheduler(batchPrefillDecodeForwardPlan.getGridScheduler());
+            if (CUDA_GRAPHS) {
+                relay.withCUDAGraph();
+            }
+            relay.execute();
+        }
+
+        state.tempLogits.clear();
+        state.wrapLogits.clear();
+        var logits = executionPlan.withGraph(taskGraphLayout.logitsIdx())
+                .withGridScheduler(batchPrefillDecodeForwardPlan.getGridScheduler());
+        if (CUDA_GRAPHS) {
+            logits.withCUDAGraph();
+        }
+        logits.execute();
+        MoECorrectnessTrace.recordGpuLogits(position, state.wrapLogits);
+        return state.wrapLogits;
+    }
+
+    /** Writes batch-router records only in the explicit correctness-trace mode. */
+    private void recordBatchRouterTrace(int layer) {
+        if (!initializationComplete || !MoECorrectnessTrace.isEnabled()
+                || !(state instanceof Qwen2MoEState moeState)) {
+            return;
+        }
+        int activeBatchSize = moeState.activeBatchSizeHolder.get(0);
+        Qwen2MoEConfiguration moeConfig = (Qwen2MoEConfiguration) config;
+        MoECorrectnessTrace.recordGpuBatchRouter(
+                state.batchStartPosHolder.get(0), layer,
+                moeState.wrapRawRouterLogitsBatch, moeState.wrapSelectedExpertsBatch,
+                moeState.wrapRoutingWeightsBatch, activeBatchSize,
+                moeConfig.numberOfExperts(), moeConfig.numberOfExpertsUsed());
+    }
 
     @Override
     public void freeTornadoExecutionPlan() {
