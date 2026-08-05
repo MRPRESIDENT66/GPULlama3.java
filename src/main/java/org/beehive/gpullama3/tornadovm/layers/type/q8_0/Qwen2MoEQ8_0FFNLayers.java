@@ -10,7 +10,6 @@ import org.beehive.gpullama3.tornadovm.kernels.TransformerComputeKernelsLayered;
 import org.beehive.gpullama3.tornadovm.layers.AbstractTransformerLayerTaskGraphs;
 import org.beehive.gpullama3.tornadovm.scheduling.SchedulerType;
 import org.beehive.gpullama3.tornadovm.scheduling.WorkerGridFactory;
-import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.WorkerGrid;
@@ -62,10 +61,6 @@ public class Qwen2MoEQ8_0FFNLayers
         dimElementWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC, 1, 1);
         WorkerGrid dimWorker = workerForRows(config.dim());
         WorkerGrid routerWorker = workerForRows(config.numberOfExperts());
-        int routerCopyGlobalSize = ((config.numberOfExperts() + LOCAL_WORK_GROUP_SIZE_ALLOC - 1)
-                / LOCAL_WORK_GROUP_SIZE_ALLOC) * LOCAL_WORK_GROUP_SIZE_ALLOC;
-        WorkerGrid routerCopyWorker = new WorkerGrid1D(routerCopyGlobalSize);
-        routerCopyWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC, 1, 1);
         WorkerGrid topKWorker = new WorkerGrid1D(LOCAL_WORK_GROUP_SIZE_ALLOC);
         topKWorker.setLocalWork(LOCAL_WORK_GROUP_SIZE_ALLOC, 1, 1);
         WorkerGrid routedExpertsHiddenWorker = workerForRows(
@@ -84,9 +79,6 @@ public class Qwen2MoEQ8_0FFNLayers
             scheduler.addWorkerGrid(prefix + "ffn_rms_reduce", rmsNormWorker);
             scheduler.addWorkerGrid(prefix + "ffn_rms_apply", dimElementWorker);
             scheduler.addWorkerGrid(prefix + "router_projection", routerWorker);
-            if (MoECorrectnessTrace.isEnabled()) {
-                scheduler.addWorkerGrid(prefix + "router_trace_copy", routerCopyWorker);
-            }
             scheduler.addWorkerGrid(prefix + "router_softmax_topk", topKWorker);
             scheduler.addWorkerGrid(prefix + "routed_experts_gate_up", routedExpertsHiddenWorker);
             scheduler.addWorkerGrid(prefix + "routed_experts_down", dimWorker);
@@ -138,9 +130,6 @@ public class Qwen2MoEQ8_0FFNLayers
                 moeState.wrapRoutingWeights, moeState.wrapExpertGate,
                 moeState.wrapSharedGate, moeState.wrapSharedWeight,
                 moeState.positionHolder, moeState.temp, moeState.tempFFN);
-        if (MoECorrectnessTrace.isEnabled()) {
-            layer.persistOnDevice(moeState.wrapRawRouterLogits);
-        }
     }
 
     /** Uploads this layer's weights for the normal single-token plan. */
@@ -245,13 +234,6 @@ public class Qwen2MoEQ8_0FFNLayers
                 weights.routerGateLayered[layerIndex].asFloatArray(),
                 config.dim(), config.numberOfExperts(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
-        // In correctness mode, preserve raw scores before softmax/top-K mutates them.
-        if (MoECorrectnessTrace.isEnabled()) {
-            layer.task("router_trace_copy", Qwen2MoEKernels::copyRouterLogits,
-                    context, moeState.wrapRouterLogits, moeState.wrapRawRouterLogits,
-                    config.numberOfExperts());
-        }
-
         layer.task("router_softmax_topk", Qwen2MoEKernels::softmaxAndTopK,
                 context, moeState.wrapRouterLogits, moeState.wrapSelectedExperts,
                 moeState.wrapRoutingWeights, config.numberOfExperts(), config.numberOfExpertsUsed());
@@ -301,11 +283,6 @@ public class Qwen2MoEQ8_0FFNLayers
                 weights.sharedDownLayered[layerIndex].asByteArray(), moeState.wrapSharedWeight, moeState.wrapX,
                 config.dim(), config.sharedExpertHiddenDim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
-        if (MoECorrectnessTrace.isEnabled()) {
-            layer.transferToHost(DataTransferMode.EVERY_EXECUTION,
-                    moeState.wrapRawRouterLogits, moeState.wrapSelectedExperts,
-                    moeState.wrapRoutingWeights);
-        }
     }
 
     /**
@@ -331,15 +308,6 @@ public class Qwen2MoEQ8_0FFNLayers
                     moeState.wrapSelectedExperts, moeState.wrapRoutingWeights,
                     moeState.wrapExpertGate, moeState.wrapSharedGate, moeState.wrapSharedWeight,
                     moeState.positionHolder, moeState.temp, moeState.tempFFN);
-        }
-        if (MoECorrectnessTrace.isEnabled()) {
-            if (layerIndex == 0) {
-                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION,
-                        moeState.wrapRawRouterLogits);
-            } else {
-                layer.consumeFromDevice("layer_" + (layerIndex - 1),
-                        moeState.wrapRawRouterLogits);
-            }
         }
         return layer;
     }

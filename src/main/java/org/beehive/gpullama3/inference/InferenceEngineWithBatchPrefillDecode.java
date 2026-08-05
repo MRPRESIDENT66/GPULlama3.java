@@ -8,7 +8,6 @@ import org.beehive.gpullama3.model.Model;
 import org.beehive.gpullama3.tokenizer.Tokenizer;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlan;
 import org.beehive.gpullama3.tornadovm.TornadoVMMasterPlanBatchPrefillDecode;
-import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -124,7 +123,6 @@ public final class InferenceEngineWithBatchPrefillDecode {
             }
 
             generatedTokens.add(nextToken);
-            MoECorrectnessTrace.recordToken(nextToken);
 
             if (onTokenGenerated != null) {
                 onTokenGenerated.accept(nextToken);
@@ -231,7 +229,7 @@ public final class InferenceEngineWithBatchPrefillDecode {
             // The final prefill row already contains the last prompt token's
             // hidden state. Use its logits for the first generated token rather
             // than forwarding that prompt token a second time.
-            var logits = plan.tornadoVMForwardBatchPrefillLogits(pos - 1);
+            var logits = plan.tornadoVMForwardBatchPrefillLogits();
             int nextToken = sampler.sampleToken(logits);
 
             if (echo) {
@@ -240,7 +238,6 @@ public final class InferenceEngineWithBatchPrefillDecode {
             }
 
             generatedTokens.add(nextToken);
-            MoECorrectnessTrace.recordToken(nextToken);
             if (onTokenGenerated != null) {
                 onTokenGenerated.accept(nextToken);
             }
@@ -268,7 +265,6 @@ public final class InferenceEngineWithBatchPrefillDecode {
             }
 
             generatedTokens.add(nextToken);
-            MoECorrectnessTrace.recordToken(nextToken);
 
             if (onTokenGenerated != null) {
                 onTokenGenerated.accept(nextToken);

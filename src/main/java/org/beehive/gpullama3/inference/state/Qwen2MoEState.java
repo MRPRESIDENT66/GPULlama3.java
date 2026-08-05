@@ -4,7 +4,6 @@ import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
 import org.beehive.gpullama3.tensor.standard.FloatTensor;
-import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
@@ -35,7 +34,6 @@ public class Qwen2MoEState extends Qwen2State {
     // separate from the CPU FloatTensor fields above: TaskGraph kernels operate on
     // TornadoVM arrays that can remain resident on the device between tasks.
     public final FloatArray wrapRouterLogits;
-    public final FloatArray wrapRawRouterLogits;
     public final IntArray wrapSelectedExperts;
     public final FloatArray wrapRoutingWeights;
     public final FloatArray wrapExpertGate;
@@ -46,13 +44,9 @@ public class Qwen2MoEState extends Qwen2State {
     // Batch-MoE buffers. The TaskGraph and their maximum sizes stay fixed;
     // every prefill execution rewrites the routing and grouping metadata on GPU.
     public final FloatArray wrapRouterLogitsBatch;
-    // Trace-only copy of scores before batched softmax/top-K mutates them.
-    public final FloatArray wrapRawRouterLogitsBatch;
     public final IntArray activeBatchSizeHolder;
     public final IntArray wrapSelectedExpertsBatch;
     public final FloatArray wrapRoutingWeightsBatch;
-    public final IntArray wrapExpertCounts;
-    public final IntArray wrapExpertOffsets;
     public final IntArray wrapGroupedAssignmentIds;
     public final IntArray wrapGroupedPositionByAssignment;
     public final FloatArray wrapGroupedExpertHidden;
@@ -71,7 +65,6 @@ public class Qwen2MoEState extends Qwen2State {
         this.yTmp = ArrayFloatTensor.allocate(c.dim());
 
         this.wrapRouterLogits = new FloatArray(c.numberOfExperts());
-        this.wrapRawRouterLogits = new FloatArray(c.numberOfExperts());
         this.wrapSelectedExperts = new IntArray(c.numberOfExpertsUsed());
         this.wrapRoutingWeights = new FloatArray(c.numberOfExpertsUsed());
         this.wrapExpertGate = new FloatArray(c.numberOfExpertsUsed() * c.moeHiddenDim());
@@ -82,14 +75,10 @@ public class Qwen2MoEState extends Qwen2State {
         if (gpuBatchSize > 1) {
             int assignments = gpuBatchSize * c.numberOfExpertsUsed();
             this.wrapRouterLogitsBatch = new FloatArray(gpuBatchSize * c.numberOfExperts());
-            this.wrapRawRouterLogitsBatch = MoECorrectnessTrace.isEnabled()
-                    ? new FloatArray(gpuBatchSize * c.numberOfExperts()) : null;
             this.activeBatchSizeHolder = new IntArray(1);
             this.activeBatchSizeHolder.init(gpuBatchSize);
             this.wrapSelectedExpertsBatch = new IntArray(assignments);
             this.wrapRoutingWeightsBatch = new FloatArray(assignments);
-            this.wrapExpertCounts = new IntArray(c.numberOfExperts());
-            this.wrapExpertOffsets = new IntArray(c.numberOfExperts() + 1);
             this.wrapGroupedAssignmentIds = new IntArray(assignments);
             this.wrapGroupedPositionByAssignment = new IntArray(assignments);
             this.wrapGroupedExpertHidden = new FloatArray(assignments * c.moeHiddenDim());
@@ -98,12 +87,9 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapSharedWeightBatch = new FloatArray(gpuBatchSize);
         } else {
             this.wrapRouterLogitsBatch = null;
-            this.wrapRawRouterLogitsBatch = null;
             this.activeBatchSizeHolder = null;
             this.wrapSelectedExpertsBatch = null;
             this.wrapRoutingWeightsBatch = null;
-            this.wrapExpertCounts = null;
-            this.wrapExpertOffsets = null;
             this.wrapGroupedAssignmentIds = null;
             this.wrapGroupedPositionByAssignment = null;
             this.wrapGroupedExpertHidden = null;

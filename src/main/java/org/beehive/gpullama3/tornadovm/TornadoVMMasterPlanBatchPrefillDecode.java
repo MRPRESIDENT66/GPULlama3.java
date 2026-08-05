@@ -1,17 +1,14 @@
 package org.beehive.gpullama3.tornadovm;
 
 import org.beehive.gpullama3.auxiliary.RunMetrics;
-import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.state.State;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.Model;
 import org.beehive.gpullama3.model.ModelType;
-import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.GGMLType;
 import org.beehive.gpullama3.tornadovm.plan.BatchPrefillDecodeForwardPlan;
 import org.beehive.gpullama3.tornadovm.plan.ForwardPlanFactory;
 import org.beehive.gpullama3.tornadovm.plan.layout.BatchPrefillDecodeForwardTaskGraphLayout;
-import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
@@ -43,7 +40,6 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
     BatchPrefillDecodeForwardTaskGraphLayout taskGraphLayout;
     public TornadoExecutionPlan executionPlan;
     private final boolean fixedBatchMoEDecode;
-    private boolean initializationComplete;
 
     // ── Construction ─────────────────────────────────────────────────────────
     TornadoVMMasterPlanBatchPrefillDecode(State initialState, Model model) {
@@ -67,7 +63,6 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
         long warmupTime = System.nanoTime();
 
         forceCopyInReadOnlyData();
-        this.initializationComplete = true;
         long copyTime = System.nanoTime();
 
         RunMetrics.setTornadoMetrics(planCreationTime - startTime, warmupTime - planCreationTime, copyTime - warmupTime);
@@ -136,7 +131,6 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
                 batchLayer.withCUDAGraph();
             }
             batchLayer.execute();
-            recordBatchRouterTrace(l);
         }
     }
     // @formatter:on
@@ -147,11 +141,11 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
     }
 
     /** Produces logits for the last token already processed by batch prefill. */
-    public FloatArray tornadoVMForwardBatchPrefillLogits(int position) {
+    public FloatArray tornadoVMForwardBatchPrefillLogits() {
         if (!fixedBatchMoEDecode) {
             throw new UnsupportedOperationException("Batch-prefill logits are currently Qwen2-MoE only");
         }
-        return runDecodeRelayAndLogits(position);
+        return runDecodeRelayAndLogits();
     }
 
     /**
@@ -198,8 +192,6 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
             logits.withCUDAGraph();
         }
         logits.execute();
-        MoECorrectnessTrace.recordGpuLogits(position, state.wrapLogits);
-
         return state.wrapLogits;
     }
     // @formatter:on
@@ -208,10 +200,10 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
         state.batchStartPosHolder.set(0, position);
         executeBatchMoE(1);
 
-        return runDecodeRelayAndLogits(position);
+        return runDecodeRelayAndLogits();
     }
 
-    private FloatArray runDecodeRelayAndLogits(int position) {
+    private FloatArray runDecodeRelayAndLogits() {
         var decodeActivation = executionPlan.withGraph(taskGraphLayout.decodeActivationIdx())
                 .withGridScheduler(batchPrefillDecodeForwardPlan.getGridScheduler());
         if (CUDA_GRAPHS) {
@@ -236,23 +228,7 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
             logits.withCUDAGraph();
         }
         logits.execute();
-        MoECorrectnessTrace.recordGpuLogits(position, state.wrapLogits);
         return state.wrapLogits;
-    }
-
-    /** Writes batch-router records only in the explicit correctness-trace mode. */
-    private void recordBatchRouterTrace(int layer) {
-        if (!initializationComplete || !MoECorrectnessTrace.isEnabled()
-                || !(state instanceof Qwen2MoEState moeState)) {
-            return;
-        }
-        int activeBatchSize = moeState.activeBatchSizeHolder.get(0);
-        Qwen2MoEConfiguration moeConfig = (Qwen2MoEConfiguration) config;
-        MoECorrectnessTrace.recordGpuBatchRouter(
-                state.batchStartPosHolder.get(0), layer,
-                moeState.wrapRawRouterLogitsBatch, moeState.wrapSelectedExpertsBatch,
-                moeState.wrapRoutingWeightsBatch, activeBatchSize,
-                moeConfig.numberOfExperts(), moeConfig.numberOfExpertsUsed());
     }
 
     @Override

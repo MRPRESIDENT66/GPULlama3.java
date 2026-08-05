@@ -7,7 +7,6 @@ import org.beehive.gpullama3.tornadovm.kernels.Qwen2MoEBatchKernels;
 import org.beehive.gpullama3.tornadovm.kernels.TransformerBatchPrefillKernels;
 import org.beehive.gpullama3.tornadovm.layers.BatchPrefillTransformerLayerTaskGraphs;
 import org.beehive.gpullama3.tornadovm.scheduling.WorkerGridFactory;
-import org.beehive.gpullama3.validation.MoECorrectnessTrace;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.KernelContext;
@@ -22,8 +21,8 @@ import java.util.stream.IntStream;
  * Fixed-graph, expert-grouped Q8_0 batch-prefill layers for Qwen2-MoE.
  *
  * <p>The graph shape and maximum WorkerGrids are static. Router results are
- * converted on the GPU into expert counts, offsets, and a grouped assignment
- * permutation that changes for every batch.</p>
+ * converted on the GPU into an expert-major assignment permutation that
+ * changes for every batch.</p>
  */
 public final class Qwen2MoEQ8_0LayersBatchPrefill
         implements BatchPrefillTransformerLayerTaskGraphs {
@@ -117,7 +116,7 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
 
         // Normalize once, then route all tokens.
         layer.task("batch_ffn_rms",
-                TransformerBatchPrefillKernels::batchedFFNRmsReduceParallel,
+                TransformerBatchPrefillKernels::batchedRmsReduceParallel,
                 context, state.wrapXBatch, state.ffnScaleBatch,
                 dim, config.rmsNormEps(), LOCAL_WORK_GROUP_SIZE);
         layer.task("batch_ffn_rms_apply",
@@ -130,23 +129,16 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 context, state.wrapXbBatch, state.wrapRouterLogitsBatch,
                 weights.routerGateLayered[layerIndex].asFloatArray(),
                 state.activeBatchSizeHolder, dim, experts, LOCAL_WORK_GROUP_SIZE);
-        if (MoECorrectnessTrace.isEnabled()) {
-            layer.task("batch_router_trace_copy",
-                    Qwen2MoEBatchKernels::copyBatchedRouterLogits,
-                    context, state.wrapRouterLogitsBatch, state.wrapRawRouterLogitsBatch,
-                    state.activeBatchSizeHolder, experts);
-        }
         layer.task("batch_router_topk",
                 Qwen2MoEBatchKernels::batchedSoftmaxAndTopK,
                 context, state.wrapRouterLogitsBatch,
                 state.wrapSelectedExpertsBatch, state.wrapRoutingWeightsBatch,
                 state.activeBatchSizeHolder, experts, topK);
 
-        // Build counts/offsets/permutation on GPU without changing the TaskGraph.
+        // Build the expert-major permutation on GPU without changing the TaskGraph.
         layer.task("batch_group_experts",
                 Qwen2MoEBatchKernels::groupAssignmentsByExpert,
                 context, state.wrapSelectedExpertsBatch,
-                state.wrapExpertCounts, state.wrapExpertOffsets,
                 state.wrapGroupedAssignmentIds, state.wrapGroupedPositionByAssignment,
                 state.activeBatchSizeHolder, experts, topK);
 
@@ -211,12 +203,6 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 weights.sharedUpLayered[layerIndex].asByteArray(),
                 weights.sharedDownLayered[layerIndex].asByteArray(),
                 weights.sharedGateInputLayered[layerIndex].asFloatArray());
-        if (MoECorrectnessTrace.isEnabled()) {
-            layer.persistOnDevice(state.wrapRawRouterLogitsBatch);
-            layer.transferToHost(DataTransferMode.EVERY_EXECUTION,
-                    state.wrapRawRouterLogitsBatch, state.wrapSelectedExpertsBatch,
-                    state.wrapRoutingWeightsBatch);
-        }
         return layer;
     }
 
@@ -230,15 +216,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapXbBatch, state.wrapQBatch, state.wrapKBatch, state.wrapVBatch,
                     state.wrapKeyCache, state.wrapValueCache,
                     state.wrapRouterLogitsBatch, state.wrapSelectedExpertsBatch,
-                    state.wrapRoutingWeightsBatch, state.wrapExpertCounts,
-                    state.wrapExpertOffsets, state.wrapGroupedAssignmentIds,
+                    state.wrapRoutingWeightsBatch, state.wrapGroupedAssignmentIds,
                     state.wrapGroupedPositionByAssignment,
                     state.wrapGroupedExpertHidden, state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch, state.wrapSharedWeightBatch);
-            if (MoECorrectnessTrace.isEnabled()) {
-                layer.transferToDevice(DataTransferMode.FIRST_EXECUTION,
-                        state.wrapRawRouterLogitsBatch);
-            }
             layer.consumeFromDevice("prefillActivation", state.wrapXBatch);
         } else {
             String predecessor = "batchPrefillLayer_" + (layerIndex - 1);
@@ -250,14 +231,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.batchStartPosHolder, state.activeBatchSizeHolder,
                     state.attnScaleBatch, state.ffnScaleBatch,
                     state.wrapRouterLogitsBatch, state.wrapSelectedExpertsBatch,
-                    state.wrapRoutingWeightsBatch, state.wrapExpertCounts,
-                    state.wrapExpertOffsets, state.wrapGroupedAssignmentIds,
+                    state.wrapRoutingWeightsBatch, state.wrapGroupedAssignmentIds,
                     state.wrapGroupedPositionByAssignment,
                     state.wrapGroupedExpertHidden, state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch, state.wrapSharedWeightBatch);
-            if (MoECorrectnessTrace.isEnabled()) {
-                layer.consumeFromDevice(predecessor, state.wrapRawRouterLogitsBatch);
-            }
         }
     }
 
@@ -309,9 +286,6 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 runtimeBatchSize * config.numberOfHeads() * attentionLocal, attentionLocal);
         WorkerGrid dimRowWorker = rowWorker(runtimeBatchSize * dim);
         WorkerGrid routerWorker = rowWorker(runtimeBatchSize * experts);
-        WorkerGrid routerTraceWorker = WorkerGridFactory.genericWorker(
-                runtimeBatchSize * experts,
-                divisorAtMost(runtimeBatchSize * experts, LOCAL_WORK_GROUP_SIZE));
         WorkerGrid topKWorker = WorkerGridFactory.genericWorker(runtimeBatchSize, 1);
         WorkerGrid groupingWorker = WorkerGridFactory.genericWorker(1, 1);
         WorkerGrid groupedGateUpWorker = rowWorker(assignments * config.moeHiddenDim());
@@ -330,9 +304,6 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
             scheduler.addWorkerGrid(prefix + "batch_ffn_rms", rmsWorker);
             scheduler.addWorkerGrid(prefix + "batch_ffn_rms_apply", elementWorker);
             scheduler.addWorkerGrid(prefix + "batch_router_projection", routerWorker);
-            if (MoECorrectnessTrace.isEnabled()) {
-                scheduler.addWorkerGrid(prefix + "batch_router_trace_copy", routerTraceWorker);
-            }
             scheduler.addWorkerGrid(prefix + "batch_router_topk", topKWorker);
             scheduler.addWorkerGrid(prefix + "batch_group_experts", groupingWorker);
             scheduler.addWorkerGrid(prefix + "batch_grouped_gate_up", groupedGateUpWorker);

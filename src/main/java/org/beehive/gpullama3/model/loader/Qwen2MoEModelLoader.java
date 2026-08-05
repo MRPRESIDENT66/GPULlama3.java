@@ -100,9 +100,6 @@ public class Qwen2MoEModelLoader extends AbstractModelLoader<Qwen2MoE, Qwen2MoEC
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_v.bias")),
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".attn_output.weight")),
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_norm.weight")),
-                null, // w1: qwen2moe has no dense ffn_gate, only routed/shared experts below
-                null, // w2: qwen2moe has no dense ffn_down
-                null, // w3: qwen2moe has no dense ffn_up
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_inp.weight")),
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_gate_exps.weight")),
                 loadArrayOfTensors(nl, i -> tensorEntries.get("blk." + i + ".ffn_up_exps.weight")),

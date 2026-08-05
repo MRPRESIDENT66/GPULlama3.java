@@ -11,15 +11,6 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
  */
 public final class Qwen2MoEKernels {
 
-    /** Copies raw router scores before softmax/top-K modifies its input buffer. */
-    public static void copyRouterLogits(KernelContext context, FloatArray source,
-                                        FloatArray destination, int numberOfExperts) {
-        int expert = context.globalIdx;
-        if (expert < numberOfExperts) {
-            destination.set(expert, source.get(expert));
-        }
-    }
-
     private static final int Q8_0_BLOCK_SIZE = 32;
     private static final int Q8_0_BLOCK_BYTES = 34;
 
@@ -201,76 +192,6 @@ public final class Qwen2MoEKernels {
             float siluGate = gate / (1.0f + TornadoMath.exp(-gate));
             int outputIndex = slot * moeHiddenDim + rowId;
             expertHidden.set(outputIndex, siluGate * up);
-        }
-    }
-
-    /**
-     * Down-projects one selected expert and accumulates its routed contribution:
-     * {@code residual += routingWeight[slot] * W_down[expert] * expertHidden}.
-     */
-    public static void routedExpertDownProjectAndAccumulateQ8_0(
-            KernelContext context,
-            FloatArray expertHidden,
-            FloatArray residual,
-            IntArray selectedExperts,
-            FloatArray routingWeights,
-            int slot,
-            ByteArray downExperts,
-            int dim,
-            int moeHiddenDim,
-            int numberOfExperts,
-            int localWorkGroupSize) {
-
-        // One workgroup produces one element of the down-projected vector.
-        int rowId = context.groupIdx;
-        int localId = context.localIdx;
-        if (rowId >= dim) {
-            return;
-        }
-
-        int expert = selectedExperts.get(slot);
-        if (expert < 0 || expert >= numberOfExperts) {
-            return;
-        }
-        float routingWeight = routingWeights.get(slot);
-
-        // downExperts has the logical shape [experts, dim, moeHiddenDim].
-        int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int rowBlockOffset = (expert * dim + rowId) * blocksPerRow;
-
-        // Every thread accumulates a different subset of this row's dot product.
-        float partialSum = 0.0f;
-        for (int column = localId;
-             column < moeHiddenDim;
-             column += localWorkGroupSize) {
-            // The start byte of the Q8_0 block holding this down-projection weight.
-            // Block layout: a 2-byte FP16 scale followed by 32 int8 quants.
-            int blockByteOffset =
-                    (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
-
-            // Quants begin immediately after the scale; column % 32 is the index within this block.
-            int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
-
-            float weight = downExperts.get(quantOffset)
-                    * downExperts.getHalfFloat(blockByteOffset).getFloat32();
-            int hiddenIndex = slot * moeHiddenDim + column;
-            partialSum += weight * expertHidden.get(hiddenIndex);
-        }
-
-        // Combine all thread-local partial sums into the completed output row.
-        float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
-        localSums[localId] = partialSum;
-        context.localBarrier();
-        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
-            if (localId < stride) {
-                localSums[localId] += localSums[localId + stride];
-            }
-            context.localBarrier();
-        }
-
-        if (localId == 0) {
-            float outputValue = localSums[0];
-            residual.set(rowId, residual.get(rowId) + routingWeight * outputValue);
         }
     }
 
@@ -518,43 +439,4 @@ public final class Qwen2MoEKernels {
         }
     }
 
-    /** Computes the shared gate sigmoid and adds the weighted shared output to the residual. */
-    public static void sharedExpertGateAndAccumulate(
-            KernelContext context,
-            FloatArray input,
-            FloatArray sharedGateInput,
-            FloatArray sharedOutput,
-            FloatArray residual,
-            int dim,
-            int localWorkGroupSize) {
-        int localId = context.localIdx;
-
-        float partialScore = 0.0f;
-
-        for (int column = localId;
-             column < dim;
-             column += localWorkGroupSize) {
-            partialScore += sharedGateInput.get(column) * input.get(column);
-        }
-
-        float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
-        localSums[localId] = partialScore;
-        context.localBarrier();
-        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
-            if (localId < stride) {
-                localSums[localId] += localSums[localId + stride];
-            }
-            context.localBarrier();
-        }
-        float gateScore = localSums[0];
-        float sharedWeight =
-                1.0f / (1.0f + TornadoMath.exp(-gateScore));
-
-        for (int index = localId;
-             index < dim;
-             index += localWorkGroupSize) {
-            residual.set(index,
-                    residual.get(index) + sharedWeight * sharedOutput.get(index));
-        }
-    }
 }

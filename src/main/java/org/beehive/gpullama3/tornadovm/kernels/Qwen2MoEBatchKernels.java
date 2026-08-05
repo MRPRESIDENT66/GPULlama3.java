@@ -11,7 +11,6 @@ public final class Qwen2MoEBatchKernels {
 
     private static final int Q8_0_BLOCK_SIZE = 32;
     private static final int Q8_0_BLOCK_BYTES = 34;
-    private static final int ACTIVE_EXPERT_TOKEN_TILE = 4;
 
     private Qwen2MoEBatchKernels() {
     }
@@ -27,19 +26,6 @@ public final class Qwen2MoEBatchKernels {
         if (column < dim) {
             int lastRowOffset = (activeBatchSizeHolder.get(0) - 1) * dim;
             decodeActivation.set(column, batchActivation.get(lastRowOffset + column));
-        }
-    }
-
-    /** Copies raw batched router scores before the softmax/Top-K task overwrites them. */
-    public static void copyBatchedRouterLogits(
-            KernelContext context,
-            FloatArray source,
-            FloatArray destination,
-            IntArray activeBatchSizeHolder,
-            int numberOfExperts) {
-        int index = context.globalIdx;
-        if (index < activeBatchSizeHolder.get(0) * numberOfExperts) {
-            destination.set(index, source.get(index));
         }
     }
 
@@ -249,8 +235,6 @@ public final class Qwen2MoEBatchKernels {
     public static void groupAssignmentsByExpert(
             KernelContext context,
             IntArray selectedExperts,
-            IntArray expertCounts,
-            IntArray expertOffsets,
             IntArray groupedAssignmentIds,
             IntArray groupedPositionByAssignment,
             IntArray activeBatchSizeHolder,
@@ -264,19 +248,14 @@ public final class Qwen2MoEBatchKernels {
         int assignmentCount = activeBatchSizeHolder.get(0) * topK;
         int writePosition = 0;
         for (int expert = 0; expert < numberOfExperts; expert++) {
-            expertOffsets.set(expert, writePosition);
-            int count = 0;
             for (int assignment = 0; assignment < assignmentCount; assignment++) {
                 if (selectedExperts.get(assignment) == expert) {
                     groupedAssignmentIds.set(writePosition, assignment);
                     groupedPositionByAssignment.set(assignment, writePosition);
                     writePosition++;
-                    count++;
                 }
             }
-            expertCounts.set(expert, count);
         }
-        expertOffsets.set(numberOfExperts, writePosition);
     }
 
     /** Computes grouped routed Gate/Up projections and SwiGLU activations. */
@@ -408,164 +387,6 @@ public final class Qwen2MoEBatchKernels {
         if (localId == 0) {
             groupedDown.set(groupedPosition * dim + row,
                     routingWeights.get(assignment) * localSums[0]);
-        }
-    }
-
-    /**
-     * Processes several assignments belonging to one active expert together.
-     * The work-group is mapped to one active expert and one output row; the
-     * expert's weight column is then reused across a small token tile.
-     */
-    public static void activeExpertTiledGateUpQ8_0(
-            KernelContext context,
-            FloatArray input,
-            IntArray activeExpertIds,
-            IntArray activeExpertCount,
-            IntArray expertCounts,
-            IntArray expertOffsets,
-            IntArray groupedAssignmentIds,
-            ByteArray gateExperts,
-            ByteArray upExperts,
-            FloatArray groupedHidden,
-            int dim,
-            int moeHiddenDim,
-            int numberOfExperts,
-            int topK,
-            int localWorkGroupSize) {
-
-        int groupId = context.groupIdx;
-        int localId = context.localIdx;
-        int expertSlot = groupId / moeHiddenDim;
-        int row = groupId % moeHiddenDim;
-        if (expertSlot >= activeExpertCount.get(0)) {
-            return;
-        }
-
-        int expert = activeExpertIds.get(expertSlot);
-        if (expert < 0 || expert >= numberOfExperts) {
-            return;
-        }
-        int assignmentStart = expertOffsets.get(expert);
-        int assignmentEnd = assignmentStart + expertCounts.get(expert);
-        float[] gatePartials = context.allocateFloatLocalArray(
-                ACTIVE_EXPERT_TOKEN_TILE * localWorkGroupSize);
-        float[] upPartials = context.allocateFloatLocalArray(
-                ACTIVE_EXPERT_TOKEN_TILE * localWorkGroupSize);
-        int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int rowBlockOffset = (expert * moeHiddenDim + row) * blocksPerRow;
-
-        for (int tileStart = assignmentStart; tileStart < assignmentEnd;
-                tileStart += ACTIVE_EXPERT_TOKEN_TILE) {
-            int tokenCount = assignmentEnd - tileStart;
-            if (tokenCount > ACTIVE_EXPERT_TOKEN_TILE) {
-                tokenCount = ACTIVE_EXPERT_TOKEN_TILE;
-            }
-            for (int tileToken = 0; tileToken < ACTIVE_EXPERT_TOKEN_TILE; tileToken++) {
-                gatePartials[tileToken * localWorkGroupSize + localId] = 0.0f;
-                upPartials[tileToken * localWorkGroupSize + localId] = 0.0f;
-            }
-            for (int column = localId; column < dim; column += localWorkGroupSize) {
-                int blockByteOffset = (rowBlockOffset + column / Q8_0_BLOCK_SIZE)
-                        * Q8_0_BLOCK_BYTES;
-                int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
-                float gateWeight = gateExperts.get(quantOffset)
-                        * gateExperts.getHalfFloat(blockByteOffset).getFloat32();
-                float upWeight = upExperts.get(quantOffset)
-                        * upExperts.getHalfFloat(blockByteOffset).getFloat32();
-                for (int tileToken = 0; tileToken < tokenCount; tileToken++) {
-                    int assignment = groupedAssignmentIds.get(tileStart + tileToken);
-                    int token = assignment / topK;
-                    float inputValue = input.get(token * dim + column);
-                    gatePartials[tileToken * localWorkGroupSize + localId]
-                            += gateWeight * inputValue;
-                    upPartials[tileToken * localWorkGroupSize + localId]
-                            += upWeight * inputValue;
-                }
-            }
-            for (int tileToken = 0; tileToken < ACTIVE_EXPERT_TOKEN_TILE; tileToken++) {
-                int base = tileToken * localWorkGroupSize;
-                reduceLocalAt(context, gatePartials, base, localId, localWorkGroupSize);
-                reduceLocalAt(context, upPartials, base, localId, localWorkGroupSize);
-                if (localId == 0 && tileToken < tokenCount) {
-                    float gate = gatePartials[base];
-                    float up = upPartials[base];
-                    float siluGate = gate / (1.0f + TornadoMath.exp(-gate));
-                    int groupedPosition = tileStart + tileToken;
-                    groupedHidden.set(groupedPosition * moeHiddenDim + row,
-                            siluGate * up);
-                }
-            }
-        }
-    }
-
-    /** Down-projects active-expert token tiles and writes routing-weighted output. */
-    public static void activeExpertTiledDownQ8_0(
-            KernelContext context,
-            FloatArray groupedHidden,
-            FloatArray groupedDown,
-            IntArray activeExpertIds,
-            IntArray activeExpertCount,
-            IntArray expertCounts,
-            IntArray expertOffsets,
-            IntArray groupedAssignmentIds,
-            FloatArray routingWeights,
-            ByteArray downExperts,
-            int dim,
-            int moeHiddenDim,
-            int numberOfExperts,
-            int topK,
-            int localWorkGroupSize) {
-
-        int groupId = context.groupIdx;
-        int localId = context.localIdx;
-        int expertSlot = groupId / dim;
-        int row = groupId % dim;
-        if (expertSlot >= activeExpertCount.get(0)) {
-            return;
-        }
-
-        int expert = activeExpertIds.get(expertSlot);
-        if (expert < 0 || expert >= numberOfExperts) {
-            return;
-        }
-        int assignmentStart = expertOffsets.get(expert);
-        int assignmentEnd = assignmentStart + expertCounts.get(expert);
-        float[] partials = context.allocateFloatLocalArray(
-                ACTIVE_EXPERT_TOKEN_TILE * localWorkGroupSize);
-        int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int rowBlockOffset = (expert * dim + row) * blocksPerRow;
-
-        for (int tileStart = assignmentStart; tileStart < assignmentEnd;
-                tileStart += ACTIVE_EXPERT_TOKEN_TILE) {
-            int tokenCount = assignmentEnd - tileStart;
-            if (tokenCount > ACTIVE_EXPERT_TOKEN_TILE) {
-                tokenCount = ACTIVE_EXPERT_TOKEN_TILE;
-            }
-            for (int tileToken = 0; tileToken < ACTIVE_EXPERT_TOKEN_TILE; tileToken++) {
-                partials[tileToken * localWorkGroupSize + localId] = 0.0f;
-            }
-            for (int column = localId; column < moeHiddenDim; column += localWorkGroupSize) {
-                int blockByteOffset = (rowBlockOffset + column / Q8_0_BLOCK_SIZE)
-                        * Q8_0_BLOCK_BYTES;
-                int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
-                float weight = downExperts.get(quantOffset)
-                        * downExperts.getHalfFloat(blockByteOffset).getFloat32();
-                for (int tileToken = 0; tileToken < tokenCount; tileToken++) {
-                    int groupedPosition = tileStart + tileToken;
-                    partials[tileToken * localWorkGroupSize + localId]
-                            += weight * groupedHidden.get(groupedPosition * moeHiddenDim + column);
-                }
-            }
-            for (int tileToken = 0; tileToken < ACTIVE_EXPERT_TOKEN_TILE; tileToken++) {
-                int base = tileToken * localWorkGroupSize;
-                reduceLocalAt(context, partials, base, localId, localWorkGroupSize);
-                if (localId == 0 && tileToken < tokenCount) {
-                    int groupedPosition = tileStart + tileToken;
-                    int assignment = groupedAssignmentIds.get(groupedPosition);
-                    groupedDown.set(groupedPosition * dim + row,
-                            routingWeights.get(assignment) * partials[base]);
-                }
-            }
         }
     }
 
@@ -731,17 +552,4 @@ public final class Qwen2MoEBatchKernels {
         }
     }
 
-    private static void reduceLocalAt(
-            KernelContext context,
-            float[] localSums,
-            int baseOffset,
-            int localId,
-            int localWorkGroupSize) {
-        for (int stride = localWorkGroupSize / 2; stride > 0; stride >>= 1) {
-            if (localId < stride) {
-                localSums[baseOffset + localId] += localSums[baseOffset + localId + stride];
-            }
-            context.localBarrier();
-        }
-    }
 }
