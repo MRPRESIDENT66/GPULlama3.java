@@ -23,6 +23,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         implements BatchPrefillTransformerLayerTaskGraphs {
 
     private static final int LOCAL_WORK_GROUP_SIZE = 32;
+    private static final int EXPERT_TILE_SIZE = 2;
+    private static final int EXPERT_2D_LOCAL_WORK_GROUP_SIZE = 128;
+    private static final int EXPERT_OUTPUT_ROWS_PER_GROUP =
+            EXPERT_2D_LOCAL_WORK_GROUP_SIZE / LOCAL_WORK_GROUP_SIZE;
 
     private final Qwen2MoEState state;
     private final Qwen2MoETornadoWeights weights;
@@ -114,6 +118,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapRoutingWeightsBatch,
                     state.wrapGroupedAssignmentIds,
                     state.wrapGroupedPositionByAssignment,
+                    state.wrapExpertTileIds,
+                    state.wrapExpertTileStarts,
+                    state.wrapExpertTileCounts,
+                    state.wrapExpertTileCountHolder,
                     state.wrapGroupedExpertHidden,
                     state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch,
@@ -140,6 +148,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapRoutingWeightsBatch,
                     state.wrapGroupedAssignmentIds,
                     state.wrapGroupedPositionByAssignment,
+                    state.wrapExpertTileIds,
+                    state.wrapExpertTileStarts,
+                    state.wrapExpertTileCounts,
+                    state.wrapExpertTileCountHolder,
                     state.wrapGroupedExpertHidden,
                     state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch,
@@ -312,47 +324,52 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
 
         layer.task(
                 "batch_group_assignments",
-                Qwen2MoEBatchKernels::groupAssignmentsByExpert,
+                Qwen2MoEBatchKernels::groupAssignmentsAndBuildExpertTiles,
                 context,
                 state.wrapSelectedExpertsBatch,
                 state.wrapGroupedAssignmentIds,
                 state.wrapGroupedPositionByAssignment,
+                state.wrapExpertTileIds,
+                state.wrapExpertTileStarts,
+                state.wrapExpertTileCounts,
+                state.wrapExpertTileCountHolder,
                 state.activeBatchSizeHolder,
                 config.numberOfExperts(),
-                topK);
+                topK,
+                EXPERT_TILE_SIZE);
 
         layer.task(
                 "batch_routed_gate_up",
-                Qwen2MoEBatchKernels::groupedRoutedExpertsGateUpSwiGLUQ8_0,
+                Qwen2MoEBatchKernels::tiled2DRoutedExpertsGateUpSwiGLUQ8_0,
                 context,
                 state.wrapXbBatch,
-                state.wrapSelectedExpertsBatch,
                 state.wrapGroupedAssignmentIds,
-                state.activeBatchSizeHolder,
+                state.wrapExpertTileIds,
+                state.wrapExpertTileStarts,
+                state.wrapExpertTileCounts,
+                state.wrapExpertTileCountHolder,
                 weights.gateExpertsLayered[layerIndex].asByteArray(),
                 weights.upExpertsLayered[layerIndex].asByteArray(),
                 state.wrapGroupedExpertHidden,
                 dim,
                 config.moeHiddenDim(),
-                config.numberOfExperts(),
                 topK,
-                LOCAL_WORK_GROUP_SIZE);
+                EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
 
         layer.task(
                 "batch_routed_down",
-                Qwen2MoEBatchKernels::groupedRoutedExpertsDownQ8_0,
+                Qwen2MoEBatchKernels::tiled2DRoutedExpertsDownQ8_0,
                 context,
                 state.wrapGroupedExpertHidden,
-                state.wrapSelectedExpertsBatch,
-                state.wrapGroupedAssignmentIds,
-                state.activeBatchSizeHolder,
+                state.wrapExpertTileIds,
+                state.wrapExpertTileStarts,
+                state.wrapExpertTileCounts,
+                state.wrapExpertTileCountHolder,
                 weights.downExpertsLayered[layerIndex].asByteArray(),
                 state.wrapGroupedExpertDown,
                 dim,
                 config.moeHiddenDim(),
-                config.numberOfExperts(),
-                topK,
-                LOCAL_WORK_GROUP_SIZE);
+                EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
 
         layer.task(
                 "batch_routed_accumulate",
@@ -430,9 +447,8 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         WorkerGrid batchDimRowsWorker = groupedRowsWorker(batchSize * dim);
         WorkerGrid routerWorker = groupedRowsWorker(batchSize * config.numberOfExperts());
         WorkerGrid groupingWorker = WorkerGridFactory.createSingleWorker();
-        WorkerGrid routedHiddenWorker =
-                groupedRowsWorker(numberOfAssignments * config.moeHiddenDim());
-        WorkerGrid routedDownWorker = groupedRowsWorker(numberOfAssignments * dim);
+        WorkerGrid routedHiddenWorker = tiledExpertRowsWorker(config.moeHiddenDim());
+        WorkerGrid routedDownWorker = tiledExpertRowsWorker(dim);
         WorkerGrid sharedHiddenWorker =
                 groupedRowsWorker(batchSize * config.sharedExpertHiddenDim());
         WorkerGrid sharedWeightWorker = groupedRowsWorker(batchSize);
@@ -463,6 +479,15 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
     /** Creates a 32-thread work-group for every logical output row. */
     private static WorkerGrid groupedRowsWorker(int rows) {
         return WorkerGridFactory.genericWorker(rows * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
+    }
+
+    /** Creates one 128-thread work-group for four output rows in every expert tile. */
+    private WorkerGrid tiledExpertRowsWorker(int outputRows) {
+        int rowTiles =
+                (outputRows + EXPERT_OUTPUT_ROWS_PER_GROUP - 1) / EXPERT_OUTPUT_ROWS_PER_GROUP;
+        int workGroups = numberOfAssignments * rowTiles;
+        return WorkerGridFactory.genericWorker(
+                workGroups * EXPERT_2D_LOCAL_WORK_GROUP_SIZE, EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
     }
 
     /** Finds a legal local size that divides the requested global dimension. */

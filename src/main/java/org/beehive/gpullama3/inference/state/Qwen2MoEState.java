@@ -48,6 +48,10 @@ public class Qwen2MoEState extends Qwen2State {
     public final FloatArray wrapRoutingWeightsBatch;
     public final IntArray wrapGroupedAssignmentIds;
     public final IntArray wrapGroupedPositionByAssignment;
+    public final IntArray wrapExpertTileIds;
+    public final IntArray wrapExpertTileStarts;
+    public final IntArray wrapExpertTileCounts;
+    public final IntArray wrapExpertTileCountHolder;
     public final FloatArray wrapGroupedExpertHidden;
     public final FloatArray wrapGroupedExpertDown;
     public final FloatArray wrapSharedHiddenBatch;
@@ -80,6 +84,10 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapRoutingWeightsBatch = new FloatArray(assignments);
             this.wrapGroupedAssignmentIds = new IntArray(assignments);
             this.wrapGroupedPositionByAssignment = new IntArray(assignments);
+            this.wrapExpertTileIds = new IntArray(assignments);
+            this.wrapExpertTileStarts = new IntArray(assignments);
+            this.wrapExpertTileCounts = new IntArray(assignments);
+            this.wrapExpertTileCountHolder = new IntArray(1);
             this.wrapGroupedExpertHidden = new FloatArray(assignments * c.moeHiddenDim());
             this.wrapGroupedExpertDown = new FloatArray(assignments * c.dim());
             this.wrapSharedHiddenBatch = new FloatArray(gpuBatchSize * c.sharedExpertHiddenDim());
@@ -91,6 +99,10 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapRoutingWeightsBatch = null;
             this.wrapGroupedAssignmentIds = null;
             this.wrapGroupedPositionByAssignment = null;
+            this.wrapExpertTileIds = null;
+            this.wrapExpertTileStarts = null;
+            this.wrapExpertTileCounts = null;
+            this.wrapExpertTileCountHolder = null;
             this.wrapGroupedExpertHidden = null;
             this.wrapGroupedExpertDown = null;
             this.wrapSharedHiddenBatch = null;
@@ -118,11 +130,11 @@ public class Qwen2MoEState extends Qwen2State {
         fields.logits = ArrayFloatTensor.allocate(config.vocabularySize());
 
         fields.keyCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa))
-                .limit(config.numberOfLayers())
-                .toArray(FloatTensor[]::new);
+                        .limit(config.numberOfLayers())
+                        .toArray(FloatTensor[]::new);
         fields.valueCache = Stream.generate(() -> ArrayFloatTensor.allocate(config.contextLength(), nEmbdGqa))
-                .limit(config.numberOfLayers())
-                .toArray(FloatTensor[]::new);
+                        .limit(config.numberOfLayers())
+                        .toArray(FloatTensor[]::new);
 
         switch (config.quantization()) {
             case "FP16" -> fields.createActivationFP16(config.dim());
