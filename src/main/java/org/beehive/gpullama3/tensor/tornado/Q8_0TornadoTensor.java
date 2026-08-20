@@ -14,7 +14,12 @@ import java.lang.foreign.MemorySegment;
  */
 public class Q8_0TornadoTensor extends TornadoTensor {
 
+    private static final int BLOCK_SIZE = 32;
+    private static final int BLOCK_BYTES = 34;
+    private static final int QUANT_ALIGNMENT = 128;
+
     private final ByteArray tornadoNativeArray; // Unified Q8_0 tensor in the memorySegment of the ByteArray
+    private ByteArray repackedArray;
 
     public Q8_0TornadoTensor(ByteArray byteArray) {
         this.tornadoNativeArray = byteArray;
@@ -27,6 +32,37 @@ public class Q8_0TornadoTensor extends TornadoTensor {
     @Override
     public ByteArray asByteArray() {
         return tornadoNativeArray;
+    }
+
+    @Override
+    public ByteArray asRepackedByteArray() {
+        ensureRepacked();
+        return repackedArray;
+    }
+
+    private synchronized void ensureRepacked() {
+        if (repackedArray != null) {
+            return;
+        }
+
+        int numberOfBlocks = tornadoNativeArray.getSize() / BLOCK_BYTES;
+        int scaleBytes = numberOfBlocks * 2;
+        int quantOffset =
+                ((scaleBytes + QUANT_ALIGNMENT - 1) / QUANT_ALIGNMENT) * QUANT_ALIGNMENT;
+        ByteArray repacked = new ByteArray(quantOffset + numberOfBlocks * BLOCK_SIZE);
+
+        for (int block = 0; block < numberOfBlocks; block++) {
+            int sourceOffset = block * BLOCK_BYTES;
+            repacked.setHalfFloat(block * 2, tornadoNativeArray.getHalfFloat(sourceOffset));
+            int destinationQuantOffset = quantOffset + block * BLOCK_SIZE;
+            for (int element = 0; element < BLOCK_SIZE; element++) {
+                repacked.set(
+                        destinationQuantOffset + element,
+                        tornadoNativeArray.get(sourceOffset + 2 + element));
+            }
+        }
+
+        repackedArray = repacked;
     }
 
     @Override

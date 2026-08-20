@@ -12,8 +12,7 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 public final class Qwen2MoEKernels {
 
     private static final int Q8_0_BLOCK_SIZE = 32;
-    private static final int Q8_0_BLOCK_BYTES = 34;
-
+    private static final int Q8_0_QUANT_ALIGNMENT = 128;
     private Qwen2MoEKernels() {
     }
 
@@ -123,23 +122,25 @@ public final class Qwen2MoEKernels {
         }
 
         int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        int numberOfBlocks = numberOfExperts * moeHiddenDim * blocksPerRow;
+        int quantBase = alignedQuantBase(numberOfBlocks);
         int rowBlockOffset = (expert * moeHiddenDim + rowId) * blocksPerRow;
 
         float gatePartialSum = 0.0f;
         float upPartialSum = 0.0f;
         if (active) {
             for (int column = localId; column < dim; column += localWorkGroupSize) {
-                int blockByteOffset =
-                        (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
-                int quantOffset =
-                        blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
+                int blockIndex = rowBlockOffset + column / Q8_0_BLOCK_SIZE;
+                int quantIndex =
+                        quantBase + blockIndex * Q8_0_BLOCK_SIZE
+                                + column % Q8_0_BLOCK_SIZE;
 
                 float inputValue = input.get(column);
-                float gateScale = gateExperts.getHalfFloat(blockByteOffset).getFloat32();
-                float upScale = upExperts.getHalfFloat(blockByteOffset).getFloat32();
+                float gateScale = gateExperts.getHalfFloat(blockIndex * 2).getFloat32();
+                float upScale = upExperts.getHalfFloat(blockIndex * 2).getFloat32();
 
-                gatePartialSum += (gateExperts.get(quantOffset) * gateScale) * inputValue;
-                upPartialSum += (upExperts.get(quantOffset) * upScale) * inputValue;
+                gatePartialSum += (gateExperts.get(quantIndex) * gateScale) * inputValue;
+                upPartialSum += (upExperts.get(quantIndex) * upScale) * inputValue;
             }
         }
 
@@ -194,6 +195,8 @@ public final class Qwen2MoEKernels {
         boolean active = rowId < dim;
 
         int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        int numberOfBlocks = numberOfExperts * dim * blocksPerRow;
+        int quantBase = alignedQuantBase(numberOfBlocks);
         float[] localSums = context.allocateFloatLocalArray(localWorkGroupSize);
 
         // Lane 0 carries the running residual across slots. Each slot is reduced with the same
@@ -215,12 +218,13 @@ public final class Qwen2MoEKernels {
                 for (int column = localId;
                      column < moeHiddenDim;
                      column += localWorkGroupSize) {
-                    int blockByteOffset =
-                            (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
-                    int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
+                    int blockIndex = rowBlockOffset + column / Q8_0_BLOCK_SIZE;
+                    int quantIndex =
+                            quantBase + blockIndex * Q8_0_BLOCK_SIZE
+                                    + column % Q8_0_BLOCK_SIZE;
 
-                    float weight = downExperts.get(quantOffset)
-                            * downExperts.getHalfFloat(blockByteOffset).getFloat32();
+                    float weight = downExperts.get(quantIndex)
+                            * downExperts.getHalfFloat(blockIndex * 2).getFloat32();
                     partialSum += weight * expertHidden.get(hiddenBase + column);
                 }
             }
@@ -266,6 +270,8 @@ public final class Qwen2MoEKernels {
 
         // Number of Q8_0 blocks needed for one row of dim weights.
         int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        int numberOfBlocks = sharedExpertHiddenDim * blocksPerRow;
+        int quantBase = alignedQuantBase(numberOfBlocks);
 
         // Index of this row's first Q8_0 block in the shared weight array.
         int rowBlockOffset = rowId * blocksPerRow;
@@ -277,25 +283,18 @@ public final class Qwen2MoEKernels {
              column < dim;
              column += localWorkGroupSize) {
 
-            //  Byte offset of the first byte of the Q8_0 block that contains this column.
-            // Each block occupies 34 bytes: a 2-byte FP16 scale plus 32 int8 quants.
-            int blockByteOffset =
-                    (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
-
-            // Skip the 2-byte scale at the block start and locate this column's int8 quant.
-            int quantOffset =
-                    blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
+            int blockIndex = rowBlockOffset + column / Q8_0_BLOCK_SIZE;
+            int quantIndex =
+                    quantBase + blockIndex * Q8_0_BLOCK_SIZE
+                            + column % Q8_0_BLOCK_SIZE;
 
             float inputValue = input.get(column);
 
-            // getHalfFloat reads the FP16 scale from the first two block bytes, then converts it to FP32.
-            float gateScale =
-                    sharedGate.getHalfFloat(blockByteOffset).getFloat32();
-            float upScale =
-                    sharedUp.getHalfFloat(blockByteOffset).getFloat32();
+            float gateScale = sharedGate.getHalfFloat(blockIndex * 2).getFloat32();
+            float upScale = sharedUp.getHalfFloat(blockIndex * 2).getFloat32();
 
-            byte gateQuant = sharedGate.get(quantOffset);
-            byte upQuant = sharedUp.get(quantOffset);
+            byte gateQuant = sharedGate.get(quantIndex);
+            byte upQuant = sharedUp.get(quantIndex);
 
             float gateWeight = gateQuant * gateScale;
             float upWeight = upQuant * upScale;
@@ -357,6 +356,8 @@ public final class Qwen2MoEKernels {
 
         // Number of Q8_0 blocks needed for one row of dim weights.
         int blocksPerRow = (sharedExpertHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        int numberOfBlocks = dim * blocksPerRow;
+        int quantBase = alignedQuantBase(numberOfBlocks);
 
         // Index of this row's first Q8_0 block in the shared weight array.
         int rowBlockOffset = rowId * blocksPerRow;
@@ -365,16 +366,13 @@ public final class Qwen2MoEKernels {
         for (int column = localId;
              column < sharedExpertHiddenDim;
              column += localWorkGroupSize) {
-            // The start byte of the Q8_0 block holding this down-projection weight.
-            // Block layout: a 2-byte FP16 scale followed by 32 int8 quants.
-            int blockByteOffset =
-                    (rowBlockOffset + column / Q8_0_BLOCK_SIZE) * Q8_0_BLOCK_BYTES;
+            int blockIndex = rowBlockOffset + column / Q8_0_BLOCK_SIZE;
+            int quantIndex =
+                    quantBase + blockIndex * Q8_0_BLOCK_SIZE
+                            + column % Q8_0_BLOCK_SIZE;
 
-            // Quants begin immediately after the scale; column % 32 is the index within this block.
-            int quantOffset = blockByteOffset + 2 + column % Q8_0_BLOCK_SIZE;
-
-            float weight = sharedDown.get(quantOffset)
-                    * sharedDown.getHalfFloat(blockByteOffset).getFloat32();
+            float weight = sharedDown.get(quantIndex)
+                    * sharedDown.getHalfFloat(blockIndex * 2).getFloat32();
             partialSum += weight * sharedHidden.get(column);
         }
 
@@ -433,5 +431,11 @@ public final class Qwen2MoEKernels {
             residual.set(index,
                     residual.get(index) + sharedWeight * sharedOutput.get(index));
         }
+    }
+
+    private static int alignedQuantBase(int numberOfBlocks) {
+        int scaleBytes = numberOfBlocks * 2;
+        return ((scaleBytes + Q8_0_QUANT_ALIGNMENT - 1) / Q8_0_QUANT_ALIGNMENT)
+                * Q8_0_QUANT_ALIGNMENT;
     }
 }

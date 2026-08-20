@@ -138,12 +138,12 @@ public class Qwen2MoEQ8_0FFNLayers
                 weights.v_biasLayered[layerIndex].asFloatArray(),
                 weights.rms_ffn_weightLayered[layerIndex].asFloatArray(),
                 weights.routerGateLayered[layerIndex].asFloatArray(),
-                weights.gateExpertsLayered[layerIndex].asByteArray(),
-                weights.upExpertsLayered[layerIndex].asByteArray(),
-                weights.downExpertsLayered[layerIndex].asByteArray(),
-                weights.sharedGateLayered[layerIndex].asByteArray(),
-                weights.sharedUpLayered[layerIndex].asByteArray(),
-                weights.sharedDownLayered[layerIndex].asByteArray(),
+                weights.gateExpertsLayered[layerIndex].asRepackedByteArray(),
+                weights.upExpertsLayered[layerIndex].asRepackedByteArray(),
+                weights.downExpertsLayered[layerIndex].asRepackedByteArray(),
+                weights.sharedGateLayered[layerIndex].asRepackedByteArray(),
+                weights.sharedUpLayered[layerIndex].asRepackedByteArray(),
+                weights.sharedDownLayered[layerIndex].asRepackedByteArray(),
                 weights.sharedGateInputLayered[layerIndex].asFloatArray());
     }
 
@@ -220,27 +220,27 @@ public class Qwen2MoEQ8_0FFNLayers
         layer.task("routed_experts_gate_up",
                 Qwen2MoEKernels::fusedRoutedExpertsGateUpSwiGLUQ8_0,
                 context, moeState.wrapXb, moeState.wrapSelectedExperts, config.numberOfExpertsUsed(),
-                weights.gateExpertsLayered[layerIndex].asByteArray(),
-                weights.upExpertsLayered[layerIndex].asByteArray(), moeState.wrapExpertGate,
+                weights.gateExpertsLayered[layerIndex].asRepackedByteArray(),
+                weights.upExpertsLayered[layerIndex].asRepackedByteArray(), moeState.wrapExpertGate,
                 config.dim(), config.moeHiddenDim(), config.numberOfExperts(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         layer.task("routed_experts_down",
                 Qwen2MoEKernels::routedExpertsDownProjectAndAccumulateQ8_0,
                 context, moeState.wrapExpertGate, moeState.wrapX,
                 moeState.wrapSelectedExperts, moeState.wrapRoutingWeights, config.numberOfExpertsUsed(),
-                weights.downExpertsLayered[layerIndex].asByteArray(),
+                weights.downExpertsLayered[layerIndex].asRepackedByteArray(),
                 config.dim(), config.moeHiddenDim(), config.numberOfExperts(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         // The shared expert always runs; it does not depend on router top-K selection.
         layer.task("shared_expert_gate_up", Qwen2MoEKernels::sharedExpertGateUpSwiGLUQ8_0,
                 context, moeState.wrapXb,
-                weights.sharedGateLayered[layerIndex].asByteArray(),
-                weights.sharedUpLayered[layerIndex].asByteArray(), moeState.wrapSharedGate,
+                weights.sharedGateLayered[layerIndex].asRepackedByteArray(),
+                weights.sharedUpLayered[layerIndex].asRepackedByteArray(), moeState.wrapSharedGate,
                 config.dim(), config.sharedExpertHiddenDim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         layer.task("shared_expert_down", Qwen2MoEKernels::sharedExpertDownProjectQ8_0,
                 context, moeState.wrapSharedGate,
-                weights.sharedDownLayered[layerIndex].asByteArray(), moeState.wrapSharedOutput,
+                weights.sharedDownLayered[layerIndex].asRepackedByteArray(), moeState.wrapSharedOutput,
                 config.dim(), config.sharedExpertHiddenDim(), LOCAL_WORK_GROUP_SIZE_ALLOC);
 
         layer.task("shared_expert_gate_and_accumulate", Qwen2MoEKernels::sharedExpertGateAndAccumulate,
