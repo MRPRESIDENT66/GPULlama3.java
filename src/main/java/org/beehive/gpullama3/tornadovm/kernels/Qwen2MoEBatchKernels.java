@@ -332,25 +332,30 @@ public final class Qwen2MoEBatchKernels {
         float upPartial0 = 0.0f;
         float gatePartial1 = 0.0f;
         float upPartial1 = 0.0f;
+        int rowBlockOffset = 0;
         if (activeRow) {
-            int rowBlockOffset = (expert * moeHiddenDim + rowId) * blocksPerRow;
-            int inputOffset0 = token0 * dim;
-            int inputOffset1 = token1 * dim;
+            rowBlockOffset = (expert * moeHiddenDim + rowId) * blocksPerRow;
+        }
+        int inputOffset0 = token0 * dim;
+        int inputOffset1 = token1 * dim;
+        float[] localScales = context.allocateFloatLocalArray(2 * rowsPerGroup);
+        for (int block = 0; block < blocksPerRow; block++) {
+            int blockByteOffset = (rowBlockOffset + block) * Q8_0_BLOCK_BYTES;
+            if (lane == 0 && activeRow) {
+                localScales[rowInTile] =
+                        gateExperts.getHalfFloat(blockByteOffset).getFloat32();
+                localScales[rowsPerGroup + rowInTile] =
+                        upExperts.getHalfFloat(blockByteOffset).getFloat32();
+            }
+            context.localBarrier();
 
-            for (int block = 0; block < blocksPerRow; block++) {
-                int column = block * Q8_0_BLOCK_SIZE + lane;
-                if (column >= dim) {
-                    continue;
-                }
-                int blockByteOffset = (rowBlockOffset + block) * Q8_0_BLOCK_BYTES;
+            int column = block * Q8_0_BLOCK_SIZE + lane;
+            if (activeRow && column < dim) {
                 int quantOffset = blockByteOffset + 2 + lane;
 
-                float gateWeight =
-                        gateExperts.get(quantOffset)
-                                * gateExperts.getHalfFloat(blockByteOffset).getFloat32();
-                float upWeight =
-                        upExperts.get(quantOffset)
-                                * upExperts.getHalfFloat(blockByteOffset).getFloat32();
+                float gateWeight = gateExperts.get(quantOffset) * localScales[rowInTile];
+                float upWeight = upExperts.get(quantOffset)
+                        * localScales[rowsPerGroup + rowInTile];
 
                 float input0 = inputBatch.get(inputOffset0 + column);
                 gatePartial0 += gateWeight * input0;
@@ -361,6 +366,7 @@ public final class Qwen2MoEBatchKernels {
                     upPartial1 += upWeight * input1;
                 }
             }
+            context.localBarrier();
         }
 
         float[] localPartials = context.allocateFloatLocalArray(4 * localWorkGroupSize);
@@ -436,25 +442,30 @@ public final class Qwen2MoEBatchKernels {
         int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
         float partial0 = 0.0f;
         float partial1 = 0.0f;
+        int rowBlockOffset = 0;
         if (activeRow) {
-            int rowBlockOffset = (expert * dim + rowId) * blocksPerRow;
+            rowBlockOffset = (expert * dim + rowId) * blocksPerRow;
+        }
+        float[] localScales = context.allocateFloatLocalArray(rowsPerGroup);
+        for (int block = 0; block < blocksPerRow; block++) {
+            int blockByteOffset = (rowBlockOffset + block) * Q8_0_BLOCK_BYTES;
+            if (lane == 0 && activeRow) {
+                localScales[rowInTile] =
+                        downExperts.getHalfFloat(blockByteOffset).getFloat32();
+            }
+            context.localBarrier();
 
-            for (int block = 0; block < blocksPerRow; block++) {
-                int column = block * Q8_0_BLOCK_SIZE + lane;
-                if (column >= moeHiddenDim) {
-                    continue;
-                }
-                int blockByteOffset = (rowBlockOffset + block) * Q8_0_BLOCK_BYTES;
+            int column = block * Q8_0_BLOCK_SIZE + lane;
+            if (activeRow && column < moeHiddenDim) {
                 int quantOffset = blockByteOffset + 2 + lane;
-                float weight =
-                        downExperts.get(quantOffset)
-                                * downExperts.getHalfFloat(blockByteOffset).getFloat32();
+                float weight = downExperts.get(quantOffset) * localScales[rowInTile];
 
                 partial0 += weight * groupedExpertHidden.get(hiddenOffset0 + column);
                 if (tileCount > 1) {
                     partial1 += weight * groupedExpertHidden.get(hiddenOffset1 + column);
                 }
             }
+            context.localBarrier();
         }
 
         float[] localPartials = context.allocateFloatLocalArray(2 * localWorkGroupSize);
