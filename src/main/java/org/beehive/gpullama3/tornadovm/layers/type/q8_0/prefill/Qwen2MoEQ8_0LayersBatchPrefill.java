@@ -591,10 +591,12 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
 
     /** Uses eight threads per output row because each thread executes one DP4A. */
     private WorkerGrid int8ActivationRoutedHiddenWorker() {
-        int rowsPerGroup = LOCAL_WORK_GROUP_SIZE / 8;
+        int rowsPerGroup = EXPERT_2D_LOCAL_WORK_GROUP_SIZE / 8;
         int rowTiles = (config.moeHiddenDim() + rowsPerGroup - 1) / rowsPerGroup;
         int workGroups = numberOfAssignments * rowTiles;
-        return WorkerGridFactory.genericWorker(workGroups * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
+        return WorkerGridFactory.genericWorker(
+                workGroups * EXPERT_2D_LOCAL_WORK_GROUP_SIZE,
+                EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
     }
 
     /** Uses one 32-thread work-group to quantize each 32-value activation block. */
