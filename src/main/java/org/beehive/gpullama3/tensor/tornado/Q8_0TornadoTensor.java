@@ -16,7 +16,10 @@ public class Q8_0TornadoTensor extends TornadoTensor {
 
     private static final int BLOCK_SIZE = 32;
     private static final int BLOCK_BYTES = 34;
-    private static final int QUANT_ALIGNMENT = 128;
+    private static final int BLOCKS_PER_REPACK_GROUP = 16;
+    private static final int REPACK_GROUP_SCALE_BYTES = BLOCKS_PER_REPACK_GROUP * 2;
+    private static final int REPACK_GROUP_BYTES =
+            REPACK_GROUP_SCALE_BYTES + BLOCKS_PER_REPACK_GROUP * BLOCK_SIZE;
 
     private final ByteArray tornadoNativeArray; // Unified Q8_0 tensor in the memorySegment of the ByteArray
     private ByteArray repackedArray;
@@ -46,15 +49,20 @@ public class Q8_0TornadoTensor extends TornadoTensor {
         }
 
         int numberOfBlocks = tornadoNativeArray.getSize() / BLOCK_BYTES;
-        int scaleBytes = numberOfBlocks * 2;
-        int quantOffset =
-                ((scaleBytes + QUANT_ALIGNMENT - 1) / QUANT_ALIGNMENT) * QUANT_ALIGNMENT;
-        ByteArray repacked = new ByteArray(quantOffset + numberOfBlocks * BLOCK_SIZE);
+        int numberOfGroups =
+                (numberOfBlocks + BLOCKS_PER_REPACK_GROUP - 1) / BLOCKS_PER_REPACK_GROUP;
+        ByteArray repacked = new ByteArray(numberOfGroups * REPACK_GROUP_BYTES);
 
         for (int block = 0; block < numberOfBlocks; block++) {
             int sourceOffset = block * BLOCK_BYTES;
-            repacked.setHalfFloat(block * 2, tornadoNativeArray.getHalfFloat(sourceOffset));
-            int destinationQuantOffset = quantOffset + block * BLOCK_SIZE;
+            int group = block / BLOCKS_PER_REPACK_GROUP;
+            int blockInGroup = block % BLOCKS_PER_REPACK_GROUP;
+            int groupOffset = group * REPACK_GROUP_BYTES;
+            int destinationScaleOffset = groupOffset + blockInGroup * 2;
+            int destinationQuantOffset =
+                    groupOffset + REPACK_GROUP_SCALE_BYTES + blockInGroup * BLOCK_SIZE;
+            repacked.setHalfFloat(
+                    destinationScaleOffset, tornadoNativeArray.getHalfFloat(sourceOffset));
             for (int element = 0; element < BLOCK_SIZE; element++) {
                 repacked.set(
                         destinationQuantOffset + element,

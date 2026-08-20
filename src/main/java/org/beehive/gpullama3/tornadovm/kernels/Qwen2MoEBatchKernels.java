@@ -10,7 +10,10 @@ import uk.ac.manchester.tornado.api.types.arrays.IntArray;
 public final class Qwen2MoEBatchKernels {
 
     private static final int Q8_0_BLOCK_SIZE = 32;
-    private static final int Q8_0_QUANT_ALIGNMENT = 128;
+    private static final int Q8_0_REPACK_GROUP_BLOCKS = 16;
+    private static final int Q8_0_REPACK_SCALE_BYTES = Q8_0_REPACK_GROUP_BLOCKS * 2;
+    private static final int Q8_0_REPACK_GROUP_BYTES =
+            Q8_0_REPACK_SCALE_BYTES + Q8_0_REPACK_GROUP_BLOCKS * Q8_0_BLOCK_SIZE;
     private Qwen2MoEBatchKernels() {}
 
     /** Computes one router score for every token-expert pair. */
@@ -328,8 +331,6 @@ public final class Qwen2MoEBatchKernels {
         }
 
         int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = numberOfExperts * moeHiddenDim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         float gatePartial0 = 0.0f;
         float upPartial0 = 0.0f;
         float gatePartial1 = 0.0f;
@@ -345,14 +346,15 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
+                int scaleOffset = repackedScaleOffset(blockIndex);
 
                 float gateWeight =
                         gateExperts.get(quantIndex)
-                                * gateExperts.getHalfFloat(blockIndex * 2).getFloat32();
+                                * gateExperts.getHalfFloat(scaleOffset).getFloat32();
                 float upWeight =
                         upExperts.get(quantIndex)
-                                * upExperts.getHalfFloat(blockIndex * 2).getFloat32();
+                                * upExperts.getHalfFloat(scaleOffset).getFloat32();
 
                 float input0 = inputBatch.get(inputOffset0 + column);
                 gatePartial0 += gateWeight * input0;
@@ -437,8 +439,6 @@ public final class Qwen2MoEBatchKernels {
         int hiddenOffset0 = tileStart * moeHiddenDim;
         int hiddenOffset1 = (tileStart + 1) * moeHiddenDim;
         int blocksPerRow = (moeHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = numberOfExperts * dim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         float partial0 = 0.0f;
         float partial1 = 0.0f;
         if (activeRow) {
@@ -450,10 +450,12 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
                 float weight =
                         downExperts.get(quantIndex)
-                                * downExperts.getHalfFloat(blockIndex * 2).getFloat32();
+                                * downExperts
+                                        .getHalfFloat(repackedScaleOffset(blockIndex))
+                                        .getFloat32();
 
                 partial0 += weight * groupedExpertHidden.get(hiddenOffset0 + column);
                 if (tileCount > 1) {
@@ -549,8 +551,6 @@ public final class Qwen2MoEBatchKernels {
         boolean activeRow = rowId < sharedExpertHiddenDim;
 
         int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = sharedExpertHiddenDim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         int rowBlockOffset = rowId * blocksPerRow;
         float gatePartial0 = 0.0f;
         float upPartial0 = 0.0f;
@@ -566,13 +566,14 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
+                int scaleOffset = repackedScaleOffset(blockIndex);
                 float gateWeight =
                         sharedGate.get(quantIndex)
-                                * sharedGate.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedGate.getHalfFloat(scaleOffset).getFloat32();
                 float upWeight =
                         sharedUp.get(quantIndex)
-                                * sharedUp.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedUp.getHalfFloat(scaleOffset).getFloat32();
 
                 if (active0) {
                     float input0 = inputBatch.get(inputOffset0 + column);
@@ -661,8 +662,6 @@ public final class Qwen2MoEBatchKernels {
         boolean activeRow = rowId < sharedExpertHiddenDim;
 
         int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = sharedExpertHiddenDim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         int rowBlockOffset = rowId * blocksPerRow;
         float gatePartial0 = 0.0f;
         float upPartial0 = 0.0f;
@@ -684,13 +683,14 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
+                int scaleOffset = repackedScaleOffset(blockIndex);
                 float gateWeight =
                         sharedGate.get(quantIndex)
-                                * sharedGate.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedGate.getHalfFloat(scaleOffset).getFloat32();
                 float upWeight =
                         sharedUp.get(quantIndex)
-                                * sharedUp.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedUp.getHalfFloat(scaleOffset).getFloat32();
 
                 if (active0) {
                     float input0 = inputBatch.get(inputOffset0 + column);
@@ -840,8 +840,6 @@ public final class Qwen2MoEBatchKernels {
 
         int blocksPerRow =
                 (sharedExpertHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = dim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         int rowBlockOffset = rowId * blocksPerRow;
         float partial0 = 0.0f;
         float partial1 = 0.0f;
@@ -855,10 +853,12 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
                 float weight =
                         sharedDown.get(quantIndex)
-                                * sharedDown.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedDown
+                                        .getHalfFloat(repackedScaleOffset(blockIndex))
+                                        .getFloat32();
                 if (active0) {
                     partial0 += weight * sharedHiddenBatch.get(hiddenOffset0 + column);
                 }
@@ -938,8 +938,6 @@ public final class Qwen2MoEBatchKernels {
 
         int blocksPerRow =
                 (sharedExpertHiddenDim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
-        int numberOfBlocks = dim * blocksPerRow;
-        int quantBase = alignedQuantBase(numberOfBlocks);
         int rowBlockOffset = rowId * blocksPerRow;
         float partial0 = 0.0f;
         float partial1 = 0.0f;
@@ -957,10 +955,12 @@ public final class Qwen2MoEBatchKernels {
                     continue;
                 }
                 int blockIndex = rowBlockOffset + block;
-                int quantIndex = quantBase + blockIndex * Q8_0_BLOCK_SIZE + lane;
+                int quantIndex = repackedQuantOffset(blockIndex) + lane;
                 float weight =
                         sharedDown.get(quantIndex)
-                                * sharedDown.getHalfFloat(blockIndex * 2).getFloat32();
+                                * sharedDown
+                                        .getHalfFloat(repackedScaleOffset(blockIndex))
+                                        .getFloat32();
                 if (active0) {
                     partial0 += weight * sharedHiddenBatch.get(hiddenOffset0 + column);
                 }
@@ -1033,9 +1033,17 @@ public final class Qwen2MoEBatchKernels {
         }
     }
 
-    private static int alignedQuantBase(int numberOfBlocks) {
-        int scaleBytes = numberOfBlocks * 2;
-        return ((scaleBytes + Q8_0_QUANT_ALIGNMENT - 1) / Q8_0_QUANT_ALIGNMENT)
-                * Q8_0_QUANT_ALIGNMENT;
+    private static int repackedScaleOffset(int blockIndex) {
+        int group = blockIndex / Q8_0_REPACK_GROUP_BLOCKS;
+        int blockInGroup = blockIndex % Q8_0_REPACK_GROUP_BLOCKS;
+        return group * Q8_0_REPACK_GROUP_BYTES + blockInGroup * 2;
+    }
+
+    private static int repackedQuantOffset(int blockIndex) {
+        int group = blockIndex / Q8_0_REPACK_GROUP_BLOCKS;
+        int blockInGroup = blockIndex % Q8_0_REPACK_GROUP_BLOCKS;
+        return group * Q8_0_REPACK_GROUP_BYTES
+                + Q8_0_REPACK_SCALE_BYTES
+                + blockInGroup * Q8_0_BLOCK_SIZE;
     }
 }
