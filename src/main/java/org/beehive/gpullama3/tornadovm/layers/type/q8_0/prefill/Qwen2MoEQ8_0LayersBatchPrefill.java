@@ -93,7 +93,9 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 weights.sharedGateLayered[layerIndex].asByteArray(),
                 weights.sharedUpLayered[layerIndex].asByteArray(),
                 weights.sharedDownLayered[layerIndex].asByteArray(),
-                weights.sharedGateInputLayered[layerIndex].asFloatArray());
+                weights.sharedGateInputLayered[layerIndex].asFloatArray(),
+                state.wrapQuantizedFfnInputBatch,
+                state.wrapQuantizedFfnInputScalesBatch);
         return layer;
     }
 
@@ -127,7 +129,9 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapGroupedExpertHidden,
                     state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch,
-                    state.wrapSharedWeightBatch);
+                    state.wrapSharedWeightBatch,
+                    state.wrapQuantizedFfnInputBatch,
+                    state.wrapQuantizedFfnInputScalesBatch);
             layer.consumeFromDevice("prefillActivation", state.wrapXBatch);
         } else {
             String predecessor = "batchPrefillLayer_" + (layerIndex - 1);
@@ -157,7 +161,9 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapGroupedExpertHidden,
                     state.wrapGroupedExpertDown,
                     state.wrapSharedHiddenBatch,
-                    state.wrapSharedWeightBatch);
+                    state.wrapSharedWeightBatch,
+                    state.wrapQuantizedFfnInputBatch,
+                    state.wrapQuantizedFfnInputScalesBatch);
         }
 
         layer.transferToDevice(
@@ -302,6 +308,16 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 dim);
 
         layer.task(
+                "batch_ffn_quantize_q8_0",
+                Qwen2MoEBatchKernels::quantizeBatchFfnInputQ8_0,
+                context,
+                state.wrapXbBatch,
+                state.wrapQuantizedFfnInputBatch,
+                state.wrapQuantizedFfnInputScalesBatch,
+                state.activeBatchSizeHolder,
+                dim);
+
+        layer.task(
                 "batch_router",
                 Qwen2MoEBatchKernels::batchedRouterProjection,
                 context,
@@ -342,9 +358,10 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
 
         layer.task(
                 "batch_routed_gate_up",
-                Qwen2MoEBatchKernels::tiled2DRoutedExpertsGateUpSwiGLUQ8_0,
+                Qwen2MoEBatchKernels::tiled2DRoutedExpertsGateUpSwiGLUQ8_0Int8Activation,
                 context,
-                state.wrapXbBatch,
+                state.wrapQuantizedFfnInputBatch,
+                state.wrapQuantizedFfnInputScalesBatch,
                 state.wrapGroupedAssignmentIds,
                 state.wrapExpertTileIds,
                 state.wrapExpertTileStarts,
@@ -484,7 +501,7 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         WorkerGrid batchDimRowsWorker = groupedRowsWorker(batchSize * dim);
         WorkerGrid routerWorker = groupedRowsWorker(batchSize * config.numberOfExperts());
         WorkerGrid groupingWorker = WorkerGridFactory.createSingleWorker();
-        WorkerGrid routedHiddenWorker = tiledExpertRowsWorker(config.moeHiddenDim());
+        WorkerGrid routedHiddenWorker = int8ActivationRoutedHiddenWorker();
         WorkerGrid routedDownWorker = tiledExpertRowsWorker(dim);
         WorkerGrid tiledSharedHiddenWorker =
                 sharedExpertTiledRowsWorker(
@@ -504,6 +521,7 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
             scheduler.addWorkerGrid(prefix + "batch_attn_out", batchDimRowsWorker);
             scheduler.addWorkerGrid(prefix + "batch_ffn_rms", rmsWorker);
             scheduler.addWorkerGrid(prefix + "batch_ffn_rms_apply", batchElementWorker);
+            scheduler.addWorkerGrid(prefix + "batch_ffn_quantize_q8_0", ffnQuantizeWorker());
             scheduler.addWorkerGrid(prefix + "batch_router", routerWorker);
             scheduler.addWorkerGrid(prefix + "batch_topk", batchScalarWorker);
             scheduler.addWorkerGrid(prefix + "batch_group_assignments", groupingWorker);
@@ -528,6 +546,21 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         int workGroups = numberOfAssignments * rowTiles;
         return WorkerGridFactory.genericWorker(
                 workGroups * EXPERT_2D_LOCAL_WORK_GROUP_SIZE, EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
+    }
+
+    /** Uses eight threads per output row because each thread executes one DP4A. */
+    private WorkerGrid int8ActivationRoutedHiddenWorker() {
+        int rowsPerGroup = LOCAL_WORK_GROUP_SIZE / 8;
+        int rowTiles = (config.moeHiddenDim() + rowsPerGroup - 1) / rowsPerGroup;
+        int workGroups = numberOfAssignments * rowTiles;
+        return WorkerGridFactory.genericWorker(workGroups * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
+    }
+
+    /** Uses one 32-thread work-group to quantize each 32-value activation block. */
+    private WorkerGrid ffnQuantizeWorker() {
+        int blocksPerToken = (dim + LOCAL_WORK_GROUP_SIZE - 1) / LOCAL_WORK_GROUP_SIZE;
+        int workGroups = batchSize * blocksPerToken;
+        return WorkerGridFactory.genericWorker(workGroups * LOCAL_WORK_GROUP_SIZE, LOCAL_WORK_GROUP_SIZE);
     }
 
     /** Creates a token-tiled, four-output-row shared-expert grid. */

@@ -1,14 +1,14 @@
 package org.beehive.gpullama3.inference.state;
 
+import java.util.stream.Stream;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tensor.standard.ArrayFloatTensor;
 import org.beehive.gpullama3.tensor.standard.FloatTensor;
+import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
-
-import java.util.stream.Stream;
 
 public class Qwen2MoEState extends Qwen2State {
 
@@ -57,6 +57,12 @@ public class Qwen2MoEState extends Qwen2State {
     public final FloatArray wrapSharedHiddenBatch;
     public final FloatArray wrapSharedWeightBatch;
 
+    // Experimental W8A8 buffers for routed Gate/Up during batch prefill.
+    // The normalized FFN input is quantized once per token and Q8_0 block, then
+    // reused by every routed-expert output row in the layer.
+    public final ByteArray wrapQuantizedFfnInputBatch;
+    public final HalfFloatArray wrapQuantizedFfnInputScalesBatch;
+
     public Qwen2MoEState(Configuration config, int batchsize) {
         super(config, batchsize);
         Qwen2MoEConfiguration c = (Qwen2MoEConfiguration) config;
@@ -92,6 +98,10 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapGroupedExpertDown = new FloatArray(assignments * c.dim());
             this.wrapSharedHiddenBatch = new FloatArray(gpuBatchSize * c.sharedExpertHiddenDim());
             this.wrapSharedWeightBatch = new FloatArray(gpuBatchSize);
+            int blocksPerInput = (c.dim() + 31) / 32;
+            this.wrapQuantizedFfnInputBatch = new ByteArray(gpuBatchSize * c.dim());
+            this.wrapQuantizedFfnInputScalesBatch =
+                    new HalfFloatArray(gpuBatchSize * blocksPerInput);
         } else {
             this.wrapRouterLogitsBatch = null;
             this.activeBatchSizeHolder = null;
@@ -107,6 +117,8 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapGroupedExpertDown = null;
             this.wrapSharedHiddenBatch = null;
             this.wrapSharedWeightBatch = null;
+            this.wrapQuantizedFfnInputBatch = null;
+            this.wrapQuantizedFfnInputScalesBatch = null;
         }
     }
 

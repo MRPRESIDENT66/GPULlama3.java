@@ -2,9 +2,12 @@ package org.beehive.gpullama3.tornadovm.kernels;
 
 import uk.ac.manchester.tornado.api.KernelContext;
 import uk.ac.manchester.tornado.api.math.TornadoMath;
+import uk.ac.manchester.tornado.api.types.HalfFloat;
 import uk.ac.manchester.tornado.api.types.arrays.ByteArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
+import uk.ac.manchester.tornado.api.types.arrays.HalfFloatArray;
 import uk.ac.manchester.tornado.api.types.arrays.IntArray;
+import uk.ac.manchester.tornado.api.utils.QuantizationUtils;
 
 /** GPU kernels used by Qwen2-MoE batch prefill. */
 public final class Qwen2MoEBatchKernels {
@@ -13,6 +16,51 @@ public final class Qwen2MoEBatchKernels {
     private static final int Q8_0_BLOCK_BYTES = 34;
 
     private Qwen2MoEBatchKernels() {}
+
+    /**
+     * Quantizes each active FFN input block to signed int8 using Q8_0's
+     * 32-value, max-absolute-value scale. The scale is stored as FP16 while
+     * quantization itself uses the full FP32 scale, matching GGML's order.
+     */
+    public static void quantizeBatchFfnInputQ8_0(
+            KernelContext context,
+            FloatArray input,
+            ByteArray quantizedInput,
+            HalfFloatArray inputScales,
+            IntArray activeBatchSizeHolder,
+            int dim) {
+        int lane = context.localIdx;
+        int blocksPerToken = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        int token = context.groupIdx / blocksPerToken;
+        int blockInToken = context.groupIdx % blocksPerToken;
+        if (token >= activeBatchSizeHolder.get(0)) {
+            return;
+        }
+
+        int column = blockInToken * Q8_0_BLOCK_SIZE + lane;
+        float value = column < dim ? input.get(token * dim + column) : 0.0f;
+        float[] localMax = context.allocateFloatLocalArray(Q8_0_BLOCK_SIZE);
+        localMax[lane] = TornadoMath.abs(value);
+        context.localBarrier();
+        for (int stride = Q8_0_BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                localMax[lane] = TornadoMath.max(localMax[lane], localMax[lane + stride]);
+            }
+            context.localBarrier();
+        }
+
+        float quantizationScale = localMax[0] / 127.0f;
+        float inverseScale = quantizationScale == 0.0f ? 0.0f : 1.0f / quantizationScale;
+        float scaled = value * inverseScale;
+        int quant = (int) (scaled + (scaled < 0.0f ? -0.5f : 0.5f));
+        quant = TornadoMath.max(-127, TornadoMath.min(127, quant));
+        if (column < dim) {
+            quantizedInput.set(token * dim + column, (byte) quant);
+        }
+        if (lane == 0) {
+            inputScales.set(token * blocksPerToken + blockInToken, new HalfFloat(quantizationScale));
+        }
+    }
 
     /** Computes one router score for every token-expert pair. */
     public static void batchedRouterProjection(
@@ -398,6 +446,129 @@ public final class Qwen2MoEBatchKernels {
                 groupedExpertHidden.set((tileStart + 1) * moeHiddenDim + rowId, siluGate1 * up1);
             }
         }
+    }
+
+    /**
+     * CUDA W8A8 variant of routed Gate/Up. Eight threads process one Q8_0
+     * block: each packs four activation and four weight quants into DP4A, then
+     * applies the two Q8_0 scales before the row reduction.
+     */
+    public static void tiled2DRoutedExpertsGateUpSwiGLUQ8_0Int8Activation(
+            KernelContext context,
+            ByteArray quantizedInputBatch,
+            HalfFloatArray inputScales,
+            IntArray groupedAssignmentIds,
+            IntArray expertTileIds,
+            IntArray expertTileStarts,
+            IntArray expertTileCounts,
+            IntArray expertTileCountHolder,
+            ByteArray gateExperts,
+            ByteArray upExperts,
+            FloatArray groupedExpertHidden,
+            int dim,
+            int moeHiddenDim,
+            int topK,
+            int localWorkGroupSize) {
+        final int valuesPerThread = 4;
+        final int threadsPerRow = Q8_0_BLOCK_SIZE / valuesPerThread;
+        int localId = context.localIdx;
+        int lane = localId % threadsPerRow;
+        int rowInTile = localId / threadsPerRow;
+        int rowsPerGroup = localWorkGroupSize / threadsPerRow;
+        int outputRowTiles = (moeHiddenDim + rowsPerGroup - 1) / rowsPerGroup;
+        int tilePosition = context.groupIdx / outputRowTiles;
+        if (tilePosition >= expertTileCountHolder.get(0)) {
+            return;
+        }
+
+        int outputRowTile = context.groupIdx % outputRowTiles;
+        int rowId = outputRowTile * rowsPerGroup + rowInTile;
+        boolean activeRow = rowId < moeHiddenDim;
+        int expert = expertTileIds.get(tilePosition);
+        int tileStart = expertTileStarts.get(tilePosition);
+        int tileCount = expertTileCounts.get(tilePosition);
+        int token0 = groupedAssignmentIds.get(tileStart) / topK;
+        int token1 = tileCount > 1 ? groupedAssignmentIds.get(tileStart + 1) / topK : token0;
+        int blocksPerRow = (dim + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+        float gatePartial0 = 0.0f;
+        float upPartial0 = 0.0f;
+        float gatePartial1 = 0.0f;
+        float upPartial1 = 0.0f;
+
+        if (activeRow) {
+            int rowBlockOffset = (expert * moeHiddenDim + rowId) * blocksPerRow;
+            for (int block = 0; block < blocksPerRow; block++) {
+                int column = block * Q8_0_BLOCK_SIZE + lane * valuesPerThread;
+                if (column + valuesPerThread > dim) {
+                    continue;
+                }
+                int blockByteOffset = (rowBlockOffset + block) * Q8_0_BLOCK_BYTES;
+                int quantOffset = blockByteOffset + 2 + lane * valuesPerThread;
+                int gateQuants = packFour(gateExperts, quantOffset);
+                int upQuants = packFour(upExperts, quantOffset);
+                float gateScale = gateExperts.getHalfFloat(blockByteOffset).getFloat32();
+                float upScale = upExperts.getHalfFloat(blockByteOffset).getFloat32();
+                int inputOffset0 = token0 * dim + column;
+                int inputQuants0 = packFour(quantizedInputBatch, inputOffset0);
+                float inputScale0 = inputScales.get(token0 * blocksPerRow + block).getFloat32();
+                gatePartial0 += QuantizationUtils.dp4a_packed(gateQuants, inputQuants0, 0)
+                        * gateScale * inputScale0;
+                upPartial0 += QuantizationUtils.dp4a_packed(upQuants, inputQuants0, 0)
+                        * upScale * inputScale0;
+                if (tileCount > 1) {
+                    int inputOffset1 = token1 * dim + column;
+                    int inputQuants1 = packFour(quantizedInputBatch, inputOffset1);
+                    float inputScale1 = inputScales.get(token1 * blocksPerRow + block).getFloat32();
+                    gatePartial1 += QuantizationUtils.dp4a_packed(gateQuants, inputQuants1, 0)
+                            * gateScale * inputScale1;
+                    upPartial1 += QuantizationUtils.dp4a_packed(upQuants, inputQuants1, 0)
+                            * upScale * inputScale1;
+                }
+            }
+        }
+
+        float[] localPartials = context.allocateFloatLocalArray(4 * localWorkGroupSize);
+        localPartials[localId] = gatePartial0;
+        localPartials[localWorkGroupSize + localId] = upPartial0;
+        localPartials[2 * localWorkGroupSize + localId] = gatePartial1;
+        localPartials[3 * localWorkGroupSize + localId] = upPartial1;
+        context.localBarrier();
+
+        int subgroupBase = rowInTile * threadsPerRow;
+        for (int stride = threadsPerRow / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                int target = subgroupBase + lane;
+                int source = target + stride;
+                localPartials[target] += localPartials[source];
+                localPartials[localWorkGroupSize + target] +=
+                        localPartials[localWorkGroupSize + source];
+                localPartials[2 * localWorkGroupSize + target] +=
+                        localPartials[2 * localWorkGroupSize + source];
+                localPartials[3 * localWorkGroupSize + target] +=
+                        localPartials[3 * localWorkGroupSize + source];
+            }
+            context.localBarrier();
+        }
+
+        if (lane == 0 && activeRow) {
+            float gate0 = localPartials[subgroupBase];
+            float up0 = localPartials[localWorkGroupSize + subgroupBase];
+            float siluGate0 = gate0 / (1.0f + TornadoMath.exp(-gate0));
+            groupedExpertHidden.set(tileStart * moeHiddenDim + rowId, siluGate0 * up0);
+            if (tileCount > 1) {
+                float gate1 = localPartials[2 * localWorkGroupSize + subgroupBase];
+                float up1 = localPartials[3 * localWorkGroupSize + subgroupBase];
+                float siluGate1 = gate1 / (1.0f + TornadoMath.exp(-gate1));
+                groupedExpertHidden.set((tileStart + 1) * moeHiddenDim + rowId, siluGate1 * up1);
+            }
+        }
+    }
+
+    private static int packFour(ByteArray values, int offset) {
+        return (values.get(offset) & 0xFF)
+                | ((values.get(offset + 1) & 0xFF) << 8)
+                | ((values.get(offset + 2) & 0xFF) << 16)
+                | ((values.get(offset + 3) & 0xFF) << 24);
     }
 
     /** Computes a 2-token by 4-output-row Down tile in one work-group. */
