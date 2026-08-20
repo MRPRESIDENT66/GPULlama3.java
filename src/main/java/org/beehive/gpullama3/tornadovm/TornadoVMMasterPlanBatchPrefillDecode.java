@@ -1,6 +1,8 @@
 package org.beehive.gpullama3.tornadovm;
 
 import org.beehive.gpullama3.auxiliary.RunMetrics;
+import org.beehive.gpullama3.diagnostics.W8A8KernelDiagnostic;
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
 import org.beehive.gpullama3.inference.state.State;
 import org.beehive.gpullama3.model.Configuration;
 import org.beehive.gpullama3.model.Model;
@@ -119,6 +121,11 @@ public class TornadoVMMasterPlanBatchPrefillDecode implements TornadoVMMasterPla
                 batchLayer.withCUDAGraph();
             }
             batchLayer.execute();
+            if (l == 0
+                    && Boolean.getBoolean("llama.w8a8.debug")
+                    && state instanceof Qwen2MoEState moeState) {
+                W8A8KernelDiagnostic.compareModelLayer(moeState, config);
+            }
         }
     }
     // @formatter:on

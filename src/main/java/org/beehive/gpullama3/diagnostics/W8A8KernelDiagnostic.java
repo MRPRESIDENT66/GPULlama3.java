@@ -1,5 +1,8 @@
 package org.beehive.gpullama3.diagnostics;
 
+import org.beehive.gpullama3.inference.state.Qwen2MoEState;
+import org.beehive.gpullama3.model.Configuration;
+import org.beehive.gpullama3.model.qwen2.Qwen2MoEConfiguration;
 import org.beehive.gpullama3.tornadovm.kernels.Qwen2MoEBatchKernels;
 import uk.ac.manchester.tornado.api.GridScheduler;
 import uk.ac.manchester.tornado.api.KernelContext;
@@ -173,5 +176,76 @@ public final class W8A8KernelDiagnostic {
                     "q[%02d] expected=%4d actual=%4d input=% .6f%n",
                     i, expected, quantizedInput.get(i), input.get(i));
         }
+    }
+
+    /** Compares real layer-0 activation quantization and Gate/Up outputs. */
+    public static void compareModelLayer(Qwen2MoEState state, Configuration configuration) {
+        Qwen2MoEConfiguration config = (Qwen2MoEConfiguration) configuration;
+        int activeTokens = state.activeBatchSizeHolder.get(0);
+        int dim = config.dim();
+        int blocksPerToken = (dim + 31) / 32;
+        int quantMismatches = 0;
+        float maxScaleError = 0.0f;
+
+        for (int token = 0; token < activeTokens; token++) {
+            for (int block = 0; block < blocksPerToken; block++) {
+                int blockStart = block * 32;
+                int blockEnd = Math.min(blockStart + 32, dim);
+                float maxAbs = 0.0f;
+                for (int column = blockStart; column < blockEnd; column++) {
+                    maxAbs = Math.max(
+                            maxAbs,
+                            Math.abs(state.wrapXbBatch.get(token * dim + column)));
+                }
+                float fullScale = maxAbs / 127.0f;
+                float expectedScale = new HalfFloat(fullScale).getFloat32();
+                float actualScale = state.wrapQuantizedFfnInputScalesBatch
+                        .get(token * blocksPerToken + block)
+                        .getFloat32();
+                maxScaleError = Math.max(maxScaleError, Math.abs(expectedScale - actualScale));
+                for (int column = blockStart; column < blockEnd; column++) {
+                    float value = state.wrapXbBatch.get(token * dim + column);
+                    float scaled = fullScale == 0.0f ? 0.0f : value / fullScale;
+                    int expected = (int) (scaled + (scaled < 0.0f ? -0.5f : 0.5f));
+                    expected = Math.max(-127, Math.min(127, expected));
+                    int actual = state.wrapQuantizedFfnInputBatch.get(token * dim + column);
+                    if (expected != actual) {
+                        quantMismatches++;
+                    }
+                }
+            }
+        }
+
+        int assignments = activeTokens * config.numberOfExpertsUsed();
+        int values = assignments * config.moeHiddenDim();
+        float maxAbsError = 0.0f;
+        double sumAbsError = 0.0;
+        double sumReferenceAbs = 0.0;
+        int maxErrorIndex = 0;
+        for (int i = 0; i < values; i++) {
+            float reference = state.wrapDebugFp32ExpertHidden.get(i);
+            float actual = state.wrapGroupedExpertHidden.get(i);
+            float error = Math.abs(reference - actual);
+            sumAbsError += error;
+            sumReferenceAbs += Math.abs(reference);
+            if (error > maxAbsError) {
+                maxAbsError = error;
+                maxErrorIndex = i;
+            }
+        }
+
+        double meanAbsError = values == 0 ? 0.0 : sumAbsError / values;
+        double relativeL1 = sumReferenceAbs == 0.0 ? 0.0 : sumAbsError / sumReferenceAbs;
+        System.err.printf(
+                "[W8A8 layer 0] activeTokens=%d quantMismatches=%d maxScaleError=%.9g%n",
+                activeTokens, quantMismatches, maxScaleError);
+        System.err.printf(
+                "[W8A8 layer 0] hidden meanAbsError=%.9g maxAbsError=%.9g relativeL1=%.6f maxIndex=%d reference=%.9g actual=%.9g%n",
+                meanAbsError,
+                maxAbsError,
+                relativeL1,
+                maxErrorIndex,
+                state.wrapDebugFp32ExpertHidden.get(maxErrorIndex),
+                state.wrapGroupedExpertHidden.get(maxErrorIndex));
     }
 }

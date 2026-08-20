@@ -27,6 +27,7 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
     private static final int EXPERT_2D_LOCAL_WORK_GROUP_SIZE = 128;
     private static final int EXPERT_OUTPUT_ROWS_PER_GROUP =
             EXPERT_2D_LOCAL_WORK_GROUP_SIZE / LOCAL_WORK_GROUP_SIZE;
+    private static final boolean W8A8_DEBUG = Boolean.getBoolean("llama.w8a8.debug");
 
     private final Qwen2MoEState state;
     private final Qwen2MoETornadoWeights weights;
@@ -73,6 +74,7 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         configureDataTransfers(layer, layerIndex);
         configureAttention(layer, layerIndex);
         configureMoE(layer, layerIndex);
+        configureW8A8Debug(layer, layerIndex);
         layer.persistOnDevice(
                 state.wrapXBatch,
                 state.wrapKeyCache,
@@ -95,7 +97,8 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                 weights.sharedDownLayered[layerIndex].asByteArray(),
                 weights.sharedGateInputLayered[layerIndex].asFloatArray(),
                 state.wrapQuantizedFfnInputBatch,
-                state.wrapQuantizedFfnInputScalesBatch);
+                state.wrapQuantizedFfnInputScalesBatch,
+                state.wrapDebugFp32ExpertHidden);
         return layer;
     }
 
@@ -131,7 +134,8 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapSharedHiddenBatch,
                     state.wrapSharedWeightBatch,
                     state.wrapQuantizedFfnInputBatch,
-                    state.wrapQuantizedFfnInputScalesBatch);
+                    state.wrapQuantizedFfnInputScalesBatch,
+                    state.wrapDebugFp32ExpertHidden);
             layer.consumeFromDevice("prefillActivation", state.wrapXBatch);
         } else {
             String predecessor = "batchPrefillLayer_" + (layerIndex - 1);
@@ -163,7 +167,8 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
                     state.wrapSharedHiddenBatch,
                     state.wrapSharedWeightBatch,
                     state.wrapQuantizedFfnInputBatch,
-                    state.wrapQuantizedFfnInputScalesBatch);
+                    state.wrapQuantizedFfnInputScalesBatch,
+                    state.wrapDebugFp32ExpertHidden);
         }
 
         layer.transferToDevice(
@@ -405,6 +410,37 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
         configureSharedExpert(layer, layerIndex);
     }
 
+    /** Runs the previous FP32-activation Gate/Up kernel beside W8A8 for diagnostics. */
+    private void configureW8A8Debug(TaskGraph layer, int layerIndex) {
+        if (!W8A8_DEBUG) {
+            return;
+        }
+        layer.task(
+                "batch_routed_gate_up_fp32_reference",
+                Qwen2MoEBatchKernels::tiled2DRoutedExpertsGateUpSwiGLUQ8_0,
+                context,
+                state.wrapXbBatch,
+                state.wrapGroupedAssignmentIds,
+                state.wrapExpertTileIds,
+                state.wrapExpertTileStarts,
+                state.wrapExpertTileCounts,
+                state.wrapExpertTileCountHolder,
+                weights.gateExpertsLayered[layerIndex].asByteArray(),
+                weights.upExpertsLayered[layerIndex].asByteArray(),
+                state.wrapDebugFp32ExpertHidden,
+                dim,
+                config.moeHiddenDim(),
+                topK,
+                EXPERT_2D_LOCAL_WORK_GROUP_SIZE);
+        layer.transferToHost(
+                DataTransferMode.EVERY_EXECUTION,
+                state.wrapXbBatch,
+                state.wrapQuantizedFfnInputBatch,
+                state.wrapQuantizedFfnInputScalesBatch,
+                state.wrapGroupedExpertHidden,
+                state.wrapDebugFp32ExpertHidden);
+    }
+
     /** Adds the tiled shared-expert Gate/Up, gate-weight, and Down tasks. */
     private void configureSharedExpert(TaskGraph layer, int layerIndex) {
         if (sharedExpertTokenTile == 4) {
@@ -526,6 +562,11 @@ public final class Qwen2MoEQ8_0LayersBatchPrefill
             scheduler.addWorkerGrid(prefix + "batch_topk", batchScalarWorker);
             scheduler.addWorkerGrid(prefix + "batch_group_assignments", groupingWorker);
             scheduler.addWorkerGrid(prefix + "batch_routed_gate_up", routedHiddenWorker);
+            if (W8A8_DEBUG) {
+                scheduler.addWorkerGrid(
+                        prefix + "batch_routed_gate_up_fp32_reference",
+                        tiledExpertRowsWorker(config.moeHiddenDim()));
+            }
             scheduler.addWorkerGrid(prefix + "batch_routed_down", routedDownWorker);
             scheduler.addWorkerGrid(prefix + "batch_routed_accumulate", batchElementWorker);
             scheduler.addWorkerGrid(prefix + "batch_shared_gate_up", tiledSharedHiddenWorker);

@@ -62,6 +62,7 @@ public class Qwen2MoEState extends Qwen2State {
     // reused by every routed-expert output row in the layer.
     public final ByteArray wrapQuantizedFfnInputBatch;
     public final HalfFloatArray wrapQuantizedFfnInputScalesBatch;
+    public final FloatArray wrapDebugFp32ExpertHidden;
 
     public Qwen2MoEState(Configuration config, int batchsize) {
         super(config, batchsize);
@@ -102,6 +103,7 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapQuantizedFfnInputBatch = new ByteArray(gpuBatchSize * c.dim());
             this.wrapQuantizedFfnInputScalesBatch =
                     new HalfFloatArray(gpuBatchSize * blocksPerInput);
+            this.wrapDebugFp32ExpertHidden = new FloatArray(assignments * c.moeHiddenDim());
         } else {
             this.wrapRouterLogitsBatch = null;
             this.activeBatchSizeHolder = null;
@@ -119,6 +121,7 @@ public class Qwen2MoEState extends Qwen2State {
             this.wrapSharedWeightBatch = null;
             this.wrapQuantizedFfnInputBatch = null;
             this.wrapQuantizedFfnInputScalesBatch = null;
+            this.wrapDebugFp32ExpertHidden = null;
         }
     }
 
